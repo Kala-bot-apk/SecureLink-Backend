@@ -10,6 +10,8 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import { admin, db } from './firebaseAdmin.js';
 import { NotificationService } from './services/notificationService.js';
+// ✅ NEW: Import Prometheus client
+import client from 'prom-client';
 
 dotenv.config();
 
@@ -20,6 +22,69 @@ const server = createServer(app);
 const HOST = '192.168.1.105';
 const PORT = process.env.PORT || 8080;
 const NODE_ENV = process.env.NODE_ENV || 'development';
+
+// ✅ NEW: Prometheus Metrics Setup
+const register = new client.Registry();
+
+// Collect default Node.js metrics
+client.collectDefaultMetrics({ 
+  register,
+  timeout: 10000,
+  gcDurationBuckets: [0.001, 0.01, 0.1, 1, 2, 5],
+  eventLoopMonitoringPrecision: 10,
+});
+
+// Custom metrics
+const httpRequestDurationMicroseconds = new client.Histogram({
+  name: 'http_request_duration_ms',
+  help: 'Duration of HTTP requests in ms',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.1, 5, 15, 50, 100, 200, 300, 400, 500, 1000, 2000, 5000]
+});
+
+const httpRequestTotal = new client.Counter({
+  name: 'http_requests_total',
+  help: 'Total number of HTTP requests',
+  labelNames: ['method', 'route', 'status_code']
+});
+
+const activeWebSocketConnections = new client.Gauge({
+  name: 'websocket_connections_active',
+  help: 'Number of active WebSocket connections'
+});
+
+const totalMessages = new client.Counter({
+  name: 'chat_messages_total',
+  help: 'Total number of chat messages sent',
+  labelNames: ['message_type', 'status']
+});
+
+const notificationsSent = new client.Counter({
+  name: 'notifications_sent_total',
+  help: 'Total number of push notifications sent',
+  labelNames: ['platform', 'status']
+});
+
+const authenticationAttempts = new client.Counter({
+  name: 'authentication_attempts_total',
+  help: 'Total number of authentication attempts',
+  labelNames: ['method', 'status']
+});
+
+const firebaseOperations = new client.Counter({
+  name: 'firebase_operations_total',
+  help: 'Total number of Firebase operations',
+  labelNames: ['operation_type', 'status']
+});
+
+// Register custom metrics
+register.registerMetric(httpRequestDurationMicroseconds);
+register.registerMetric(httpRequestTotal);
+register.registerMetric(activeWebSocketConnections);
+register.registerMetric(totalMessages);
+register.registerMetric(notificationsSent);
+register.registerMetric(authenticationAttempts);
+register.registerMetric(firebaseOperations);
 
 // Socket.io setup
 const io = new Server(server, {
@@ -52,6 +117,26 @@ app.use(cors({
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 
+// ✅ NEW: Prometheus metrics middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  
+  res.on('finish', () => {
+    const responseTimeInMs = Date.now() - start;
+    const route = req.route ? req.route.path : req.path;
+    
+    httpRequestDurationMicroseconds
+      .labels(req.method, route, res.statusCode.toString())
+      .observe(responseTimeInMs);
+    
+    httpRequestTotal
+      .labels(req.method, route, res.statusCode.toString())
+      .inc();
+  });
+  
+  next();
+});
+
 // Enhanced rate limiting
 const createRateLimiter = (windowMs, max, message) => rateLimit({
   windowMs,
@@ -80,6 +165,7 @@ async function authenticate(req, res, next) {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    authenticationAttempts.labels('bearer_token', 'missing_header').inc();
     return res.status(401).json({ 
       error: 'Authorization header required',
       code: 'AUTH_HEADER_MISSING'
@@ -89,6 +175,7 @@ async function authenticate(req, res, next) {
   const token = authHeader.split(' ')[1];
 
   if (!token) {
+    authenticationAttempts.labels('bearer_token', 'missing_token').inc();
     return res.status(401).json({ 
       error: 'Token missing',
       code: 'TOKEN_MISSING'
@@ -101,8 +188,10 @@ async function authenticate(req, res, next) {
     req.userId = decodedToken.uid;
 
     const userDoc = await db.collection('users').doc(req.userId).get();
+    firebaseOperations.labels('user_fetch', 'success').inc();
     
     if (!userDoc.exists) {
+      authenticationAttempts.labels('bearer_token', 'user_not_found').inc();
       return res.status(404).json({ 
         error: 'User profile not found',
         code: 'USER_NOT_FOUND'
@@ -115,9 +204,11 @@ async function authenticate(req, res, next) {
     // Update last active timestamp
     await updateUserActivity(req.userId);
     
+    authenticationAttempts.labels('bearer_token', 'success').inc();
     next();
   } catch (error) {
     console.error('❌ Authentication error:', error);
+    firebaseOperations.labels('auth_verify', 'error').inc();
     
     let errorMessage = 'Invalid or expired token';
     let errorCode = 'TOKEN_INVALID';
@@ -130,6 +221,7 @@ async function authenticate(req, res, next) {
       errorCode = 'TOKEN_FORMAT_INVALID';
     }
     
+    authenticationAttempts.labels('bearer_token', 'failed').inc();
     return res.status(401).json({ 
       error: errorMessage,
       code: errorCode
@@ -143,8 +235,10 @@ async function updateUserActivity(userId) {
     await db.collection('users').doc(userId).update({
       lastActive: admin.firestore.FieldValue.serverTimestamp()
     });
+    firebaseOperations.labels('user_update', 'success').inc();
   } catch (error) {
     console.error('❌ Error updating user activity:', error);
+    firebaseOperations.labels('user_update', 'error').inc();
   }
 }
 
@@ -156,17 +250,31 @@ async function findUserByContactId(contactId) {
       .limit(1)
       .get();
     
+    firebaseOperations.labels('user_query', 'success').inc();
     return userQuery.empty ? null : {
       id: userQuery.docs[0].id,
       data: userQuery.docs[0].data()
     };
   } catch (error) {
     console.error('❌ Error finding user by contactId:', error);
+    firebaseOperations.labels('user_query', 'error').inc();
     return null;
   }
 }
 
 // API Routes
+
+// ✅ NEW: Prometheus metrics endpoint
+app.get('/metrics', async (req, res) => {
+  try {
+    res.set('Content-Type', register.contentType);
+    const metrics = await register.metrics();
+    res.end(metrics);
+  } catch (error) {
+    console.error('❌ Error generating metrics:', error);
+    res.status(500).end(error.toString());
+  }
+});
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -179,7 +287,8 @@ app.get('/api/health', (req, res) => {
     port: PORT,
     version: '1.0.0',
     uptime: process.uptime(),
-    notifications: 'enabled'
+    notifications: 'enabled',
+    metrics: 'enabled'
   });
 });
 
@@ -216,6 +325,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     await db.collection('users').doc(userId).update(updateData);
+    firebaseOperations.labels('user_login', 'success').inc();
 
     // Store contact to user mapping
     contactToUser.set(contactId, userId);
@@ -229,6 +339,7 @@ app.post('/api/auth/login', async (req, res) => {
 
   } catch (error) {
     console.error('❌ Login error:', error);
+    firebaseOperations.labels('user_login', 'error').inc();
     return res.status(401).json({ 
       error: 'Invalid Firebase token',
       code: 'INVALID_TOKEN'
@@ -273,6 +384,7 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
     const recipientUser = await findUserByContactId(recipientContactId);
     
     if (!recipientUser) {
+      totalMessages.labels(messageType, 'recipient_not_found').inc();
       return res.status(404).json({ 
         error: 'Recipient not found',
         code: 'RECIPIENT_NOT_FOUND'
@@ -334,6 +446,7 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
     }, { merge: true });
 
     await batch.commit();
+    firebaseOperations.labels('message_batch', 'success').inc();
 
     // Check if recipient is online via WebSocket
     const recipientConnection = [...activeConnections.values()]
@@ -368,11 +481,15 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
 
         await notificationService.sendNotification(notificationData);
         notificationSent = true;
+        notificationsSent.labels(recipientData.platform || 'unknown', 'success').inc();
         console.log(`🔔 Push notification sent to ${recipientContactId}`);
       } catch (notifError) {
         console.error('❌ Failed to send push notification:', notifError);
+        notificationsSent.labels(recipientData.platform || 'unknown', 'error').inc();
       }
     }
+
+    totalMessages.labels(messageType, 'success').inc();
 
     res.json({ 
       success: true,
@@ -385,6 +502,8 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
 
   } catch (error) {
     console.error('❌ Send message error:', error);
+    totalMessages.labels(messageType || 'text', 'error').inc();
+    firebaseOperations.labels('message_batch', 'error').inc();
     res.status(500).json({ 
       error: 'Failed to send message',
       code: 'MESSAGE_SEND_FAILED'
@@ -408,11 +527,13 @@ app.post('/api/notifications/register', authenticate, async (req, res) => {
       lastTokenUpdate: admin.firestore.FieldValue.serverTimestamp()
     });
 
+    firebaseOperations.labels('fcm_register', 'success').inc();
     console.log(`🔔 FCM token registered for ${req.contactId}`);
     res.json({ success: true, message: 'FCM token registered successfully' });
 
   } catch (error) {
     console.error('❌ Error registering FCM token:', error);
+    firebaseOperations.labels('fcm_register', 'error').inc();
     res.status(500).json({ error: 'Failed to register FCM token' });
   }
 });
@@ -442,12 +563,14 @@ app.post('/api/notifications/send', authenticate, async (req, res) => {
     };
 
     await notificationService.sendNotification(notificationData);
+    notificationsSent.labels(targetUser.data.platform || 'unknown', 'success').inc();
     
     console.log(`🔔 Custom notification sent: ${req.contactId} → ${targetContactId}`);
     res.json({ success: true, message: 'Notification sent successfully' });
 
   } catch (error) {
     console.error('❌ Error sending notification:', error);
+    notificationsSent.labels('unknown', 'error').inc();
     res.status(500).json({ error: 'Failed to send notification' });
   }
 });
@@ -475,11 +598,13 @@ app.get('/api/chats', authenticate, async (req, res) => {
       });
     });
 
+    firebaseOperations.labels('chats_fetch', 'success').inc();
     console.log(`📬 Retrieved ${chats.length} chats for ${req.contactId}`);
     res.json({ chats, count: chats.length });
 
   } catch (error) {
     console.error('❌ Get chats error:', error);
+    firebaseOperations.labels('chats_fetch', 'error').inc();
     res.status(500).json({ 
       error: 'Failed to fetch chats',
       code: 'CHATS_FETCH_FAILED'
@@ -515,6 +640,7 @@ app.get('/api/chat/:contactId/messages', authenticate, async (req, res) => {
     // Reverse to get chronological order (oldest first)
     messages.reverse();
 
+    firebaseOperations.labels('messages_fetch', 'success').inc();
     console.log(`📬 Retrieved ${messages.length} messages for ${req.contactId} ↔ ${contactId}`);
     res.json({ 
       messages, 
@@ -524,6 +650,7 @@ app.get('/api/chat/:contactId/messages', authenticate, async (req, res) => {
 
   } catch (error) {
     console.error('❌ Get messages error:', error);
+    firebaseOperations.labels('messages_fetch', 'error').inc();
     res.status(500).json({ 
       error: 'Failed to fetch messages',
       code: 'MESSAGES_FETCH_FAILED'
@@ -542,10 +669,12 @@ app.post('/api/chat/delivered/:messageId', authenticate, async (req, res) => {
       deliveredBy: req.contactId
     }, { merge: true });
 
+    firebaseOperations.labels('message_status', 'success').inc();
     console.log(`✅ Message ${messageId} marked as delivered by ${req.contactId}`);
     res.json({ status: 'delivered' });
   } catch (error) {
     console.error('❌ Mark delivered error:', error);
+    firebaseOperations.labels('message_status', 'error').inc();
     res.status(500).json({ error: 'Failed to mark as delivered' });
   }
 });
@@ -561,10 +690,12 @@ app.post('/api/chat/read/:messageId', authenticate, async (req, res) => {
       readBy: req.contactId
     }, { merge: true });
 
+    firebaseOperations.labels('message_status', 'success').inc();
     console.log(`👁️ Message ${messageId} marked as read by ${req.contactId}`);
     res.json({ status: 'read' });
   } catch (error) {
     console.error('❌ Mark read error:', error);
+    firebaseOperations.labels('message_status', 'error').inc();
     res.status(500).json({ error: 'Failed to mark as read' });
   }
 });
@@ -606,6 +737,7 @@ app.get('/api/contacts/lookup/:contactId', authenticate, async (req, res) => {
 // WebSocket connection handling
 io.on('connection', (socket) => {
   console.log(`🔌 Socket connected: ${socket.id}`);
+  activeWebSocketConnections.inc();
 
   socket.on('authenticate', async (data) => {
     try {
@@ -729,6 +861,7 @@ io.on('connection', (socket) => {
       
       activeConnections.delete(userId);
       socketToUser.delete(socket.id);
+      activeWebSocketConnections.dec();
       
       console.log(`🔌 Socket disconnected: ${userId} (${socket.id}), reason: ${reason}`);
     }
@@ -758,6 +891,20 @@ app.use('*', (req, res) => {
   });
 });
 
+// ✅ NEW: Self-ping function to prevent Render sleeping
+setInterval(async () => {
+  try {
+    const response = await fetch(`http://${HOST}:${PORT}/api/health`);
+    if (response.ok) {
+      console.log('🏓 Self-ping successful');
+    } else {
+      console.warn('⚠️ Self-ping failed with status:', response.status);
+    }
+  } catch (error) {
+    console.warn('⚠️ Self-ping error:', error.message);
+  }
+}, 6 * 60 * 1000); // Every 6 minutes
+
 // Cleanup inactive connections every 5 minutes
 setInterval(() => {
   const now = Date.now();
@@ -777,6 +924,11 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// ✅ NEW: Update WebSocket connections gauge every minute
+setInterval(() => {
+  activeWebSocketConnections.set(activeConnections.size);
+}, 60 * 1000);
+
 // Start server
 server.listen(PORT, HOST, () => {
   console.log(`🚀 SecureLink Server running on http://${HOST}:${PORT}`);
@@ -784,6 +936,8 @@ server.listen(PORT, HOST, () => {
   console.log(`🔔 Push notifications: enabled`);
   console.log(`⚡ WebSocket: enabled`);
   console.log(`🛡️ Security: enabled`);
+  console.log(`📊 Prometheus metrics: enabled on /metrics`);
+  console.log(`🏓 Self-ping: enabled (every 6 minutes)`);
 });
 
 // Graceful shutdown
