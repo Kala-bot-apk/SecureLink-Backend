@@ -10,7 +10,6 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import { admin, db } from './firebaseAdmin.js';
 import { NotificationService } from './services/notificationService.js';
-// ✅ NEW: Import Prometheus client
 import client from 'prom-client';
 
 dotenv.config();
@@ -18,12 +17,20 @@ dotenv.config();
 const app = express();
 const server = createServer(app);
 
-// Configuration
-const HOST = 'https://securelink-backend-e65c.onrender.com';
-const PORT = process.env.PORT || 8080;
+// ✅ FIXED: Configuration for Render deployment
+const HOST = process.env.RENDER_INTERNAL_HOST || '0.0.0.0'; // Must bind to 0.0.0.0 for Render
+const PORT = process.env.PORT || 10000; // Render default is 10000
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
-// ✅ NEW: Prometheus Metrics Setup
+// ✅ FIXED: Get external URL for self-ping
+const getExternalUrl = () => {
+  if (process.env.RENDER_EXTERNAL_URL) {
+    return process.env.RENDER_EXTERNAL_URL; // Render provides this automatically
+  }
+  return `http://localhost:${PORT}`; // Local fallback
+};
+
+// Prometheus Metrics Setup
 const register = new client.Registry();
 
 // Collect default Node.js metrics
@@ -117,7 +124,7 @@ app.use(cors({
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// ✅ NEW: Prometheus metrics middleware
+// Prometheus metrics middleware
 app.use((req, res, next) => {
   const start = Date.now();
   
@@ -156,9 +163,9 @@ app.use('/api/notifications', createRateLimiter(1 * 60 * 1000, 30, 'Too many not
 app.use('/api', createRateLimiter(1 * 60 * 1000, 200, 'Too many requests'));
 
 // Session management
-const activeConnections = new Map(); // userId => { socketId, contactId, lastActive, deviceId }
-const socketToUser = new Map(); // socketId => userId
-const contactToUser = new Map(); // contactId => userId
+const activeConnections = new Map();
+const socketToUser = new Map();
+const contactToUser = new Map();
 
 // Enhanced authentication middleware
 async function authenticate(req, res, next) {
@@ -201,7 +208,6 @@ async function authenticate(req, res, next) {
     req.profile = userDoc.data();
     req.contactId = req.profile.contactId;
 
-    // Update last active timestamp
     await updateUserActivity(req.userId);
     
     authenticationAttempts.labels('bearer_token', 'success').inc();
@@ -264,7 +270,7 @@ async function findUserByContactId(contactId) {
 
 // API Routes
 
-// ✅ NEW: Prometheus metrics endpoint
+// Prometheus metrics endpoint
 app.get('/metrics', async (req, res) => {
   try {
     res.set('Content-Type', register.contentType);
@@ -308,7 +314,6 @@ app.post('/api/auth/login', async (req, res) => {
 
     console.log(`🔐 Login: ${userId}, contactId: ${contactId}, device: ${deviceId}`);
 
-    // Update user status with FCM token
     const updateData = {
       isOnline: true,
       lastSeen: admin.firestore.FieldValue.serverTimestamp(),
@@ -317,7 +322,6 @@ app.post('/api/auth/login', async (req, res) => {
       contactId: contactId
     };
 
-    // Add FCM token if provided
     if (fcmToken) {
       updateData.fcmToken = fcmToken;
       updateData.platform = req.headers['user-agent']?.includes('iPhone') ? 'ios' : 'android';
@@ -327,7 +331,6 @@ app.post('/api/auth/login', async (req, res) => {
     await db.collection('users').doc(userId).update(updateData);
     firebaseOperations.labels('user_login', 'success').inc();
 
-    // Store contact to user mapping
     contactToUser.set(contactId, userId);
 
     res.json({ 
@@ -380,7 +383,6 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
 
     console.log(`📨 Message: ${req.contactId} → ${recipientContactId}`);
 
-    // Find recipient user
     const recipientUser = await findUserByContactId(recipientContactId);
     
     if (!recipientUser) {
@@ -394,10 +396,8 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
     const recipientUserId = recipientUser.id;
     const recipientData = recipientUser.data;
 
-    // Use Firestore batch for atomic operations
     const batch = db.batch();
     
-    // Store message in sender's chat
     const senderChatRef = db.collection('users')
       .doc(req.userId)
       .collection('chats')
@@ -406,7 +406,6 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
       .doc(messageId);
     batch.set(senderChatRef, messageData);
 
-    // Store message in recipient's chat
     const recipientChatRef = db.collection('users')
       .doc(recipientUserId)
       .collection('chats')
@@ -415,7 +414,6 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
       .doc(messageId);
     batch.set(recipientChatRef, messageData);
 
-    // Update chat metadata for sender
     const senderMetaRef = db.collection('users')
       .doc(req.userId)
       .collection('chats')
@@ -430,7 +428,6 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
       isOnline: recipientData.isOnline || false
     }, { merge: true });
 
-    // Update chat metadata for recipient
     const recipientMetaRef = db.collection('users')
       .doc(recipientUserId)
       .collection('chats')
@@ -448,7 +445,6 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
     await batch.commit();
     firebaseOperations.labels('message_batch', 'success').inc();
 
-    // Check if recipient is online via WebSocket
     const recipientConnection = [...activeConnections.values()]
       .find(conn => conn.contactId === recipientContactId);
 
@@ -464,7 +460,6 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
       }
     }
 
-    // Send push notification if recipient is offline or message is not silent
     if ((!recipientOnline || !silent) && recipientData.fcmToken) {
       try {
         const notificationData = {
@@ -511,7 +506,7 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
   }
 });
 
-// Notification endpoints
+// [ALL OTHER API ENDPOINTS - keeping all your existing functionality]
 app.post('/api/notifications/register', authenticate, async (req, res) => {
   const { fcmToken, platform, deviceId } = req.body;
 
@@ -575,7 +570,6 @@ app.post('/api/notifications/send', authenticate, async (req, res) => {
   }
 });
 
-// Get user chats
 app.get('/api/chats', authenticate, async (req, res) => {
   try {
     const chatsSnapshot = await db.collection('users')
@@ -612,7 +606,6 @@ app.get('/api/chats', authenticate, async (req, res) => {
   }
 });
 
-// Get messages for a specific chat
 app.get('/api/chat/:contactId/messages', authenticate, async (req, res) => {
   const { contactId } = req.params;
   const limit = Math.min(parseInt(req.query.limit) || 50, 100);
@@ -637,7 +630,6 @@ app.get('/api/chat/:contactId/messages', authenticate, async (req, res) => {
       });
     });
 
-    // Reverse to get chronological order (oldest first)
     messages.reverse();
 
     firebaseOperations.labels('messages_fetch', 'success').inc();
@@ -658,7 +650,6 @@ app.get('/api/chat/:contactId/messages', authenticate, async (req, res) => {
   }
 });
 
-// Mark messages as delivered
 app.post('/api/chat/delivered/:messageId', authenticate, async (req, res) => {
   const { messageId } = req.params;
 
@@ -679,7 +670,6 @@ app.post('/api/chat/delivered/:messageId', authenticate, async (req, res) => {
   }
 });
 
-// Mark messages as read
 app.post('/api/chat/read/:messageId', authenticate, async (req, res) => {
   const { messageId } = req.params;
 
@@ -700,7 +690,6 @@ app.post('/api/chat/read/:messageId', authenticate, async (req, res) => {
   }
 });
 
-// Contact lookup
 app.get('/api/contacts/lookup/:contactId', authenticate, async (req, res) => {
   const { contactId } = req.params;
 
@@ -751,7 +740,6 @@ io.on('connection', (socket) => {
       const decodedToken = await admin.auth().verifyIdToken(token);
       const userId = decodedToken.uid;
 
-      // Disconnect any existing socket for this user
       if (activeConnections.has(userId)) {
         const existingConnection = activeConnections.get(userId);
         if (existingConnection.socketId && existingConnection.socketId !== socket.id) {
@@ -764,7 +752,6 @@ io.on('connection', (socket) => {
         }
       }
 
-      // Store new connection
       activeConnections.set(userId, { 
         socketId: socket.id, 
         contactId,
@@ -775,7 +762,6 @@ io.on('connection', (socket) => {
       socketToUser.set(socket.id, userId);
       contactToUser.set(contactId, userId);
 
-      // Update user online status
       await db.collection('users').doc(userId).update({
         isOnline: true,
         lastActive: admin.firestore.FieldValue.serverTimestamp()
@@ -793,7 +779,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Handle typing indicators
   socket.on('typing_start', (data) => {
     const userId = socketToUser.get(socket.id);
     if (userId && data.contactId) {
@@ -820,7 +805,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Handle message delivery confirmation
   socket.on('message_delivered', async (data) => {
     const { messageId } = data;
     if (messageId) {
@@ -840,7 +824,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Handle disconnect
   socket.on('disconnect', async (reason) => {
     const userId = socketToUser.get(socket.id);
     if (userId) {
@@ -867,7 +850,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Handle ping-pong for connection health
   socket.on('ping', () => {
     socket.emit('pong', { timestamp: Date.now() });
   });
@@ -891,24 +873,33 @@ app.use('*', (req, res) => {
   });
 });
 
-// ✅ NEW: Self-ping function to prevent Render sleeping
+// ✅ FIXED: Self-ping function for Render deployment
 setInterval(async () => {
   try {
-    const response = await fetch(`${HOST}/api/health`);
+    const externalUrl = getExternalUrl();
+    const healthUrl = `${externalUrl}/api/health`;
+    
+    console.log(`🏓 Self-ping to: ${healthUrl}`);
+    
+    const response = await fetch(healthUrl, {
+      method: 'GET',
+      timeout: 10000,
+    });
+    
     if (response.ok) {
       console.log('🏓 Self-ping successful');
     } else {
-      console.warn('⚠️ Self-ping failed with status:', response.status);
+      console.warn(`⚠️ Self-ping failed with status: ${response.status}`);
     }
   } catch (error) {
-    console.warn('⚠️ Self-ping error:', error.message);
+    console.warn(`⚠️ Self-ping error: ${error.message}`);
   }
 }, 6 * 60 * 1000); // Every 6 minutes
 
 // Cleanup inactive connections every 5 minutes
 setInterval(() => {
   const now = Date.now();
-  const inactiveThreshold = 10 * 60 * 1000; // 10 minutes
+  const inactiveThreshold = 10 * 60 * 1000;
 
   for (const [userId, connection] of activeConnections.entries()) {
     if (now - connection.lastActive > inactiveThreshold) {
@@ -924,14 +915,15 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// ✅ NEW: Update WebSocket connections gauge every minute
+// Update WebSocket connections gauge every minute
 setInterval(() => {
   activeWebSocketConnections.set(activeConnections.size);
 }, 60 * 1000);
 
-// Start server
+// ✅ FIXED: Start server with proper host binding for Render
 server.listen(PORT, HOST, () => {
   console.log(`🚀 SecureLink Server running on http://${HOST}:${PORT}`);
+  console.log(`🌐 External URL: ${getExternalUrl()}`);
   console.log(`📱 Environment: ${NODE_ENV}`);
   console.log(`🔔 Push notifications: enabled`);
   console.log(`⚡ WebSocket: enabled`);
@@ -973,6 +965,3 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 export { io, activeConnections };
-
-
-
