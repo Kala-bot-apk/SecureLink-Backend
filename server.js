@@ -19,7 +19,7 @@ const app = express();
 const server = createServer(app);
 
 // Configuration
-const HOST = '192.168.1.105';
+const HOST = 'https://securelink-backend-e65c.onrender.com';
 const PORT = process.env.PORT || 8080;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
@@ -894,7 +894,7 @@ app.use('*', (req, res) => {
 // ✅ NEW: Self-ping function to prevent Render sleeping
 setInterval(async () => {
   try {
-    const response = await fetch(`http://${HOST}:${PORT}/api/health`);
+    const response = await fetch(`http://${HOST}/api/health`);
     if (response.ok) {
       console.log('🏓 Self-ping successful');
     } else {
@@ -973,3 +973,4 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 export { io, activeConnections };
+
