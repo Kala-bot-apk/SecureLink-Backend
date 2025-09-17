@@ -894,7 +894,7 @@ app.use('*', (req, res) => {
 // ✅ NEW: Self-ping function to prevent Render sleeping
 setInterval(async () => {
   try {
-    const response = await fetch(`http://${HOST}/api/health`);
+    const response = await fetch(`https://${HOST}/api/health`);
     if (response.ok) {
       console.log('🏓 Self-ping successful');
     } else {
@@ -973,4 +973,5 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 export { io, activeConnections };
+
 
