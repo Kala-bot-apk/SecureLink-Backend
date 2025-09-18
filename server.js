@@ -13,6 +13,7 @@ import compression from 'compression';
 import { admin, db, FieldValue } from './firebaseAdmin.js';
 import notificationService from './services/notificationService.js'; // ✅ Fixed import
 import * as client from 'prom-client';
+import { Expo } from 'expo-server-sdk';
 
 // Load environment variables
 dotenv.config();
@@ -752,44 +753,51 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
       }
     }
 
-    // Send push notification if recipient is offline or not on silent mode
-    if ((!recipientOnline || !silent) && recipientData.fcmToken && !recipientData.notificationsDisabled) {
-      try {
-        const notificationData = {
-          title: req.profile.displayName || req.contactId,
-          body: messageType === 'text' 
-            ? (content.length > 50 ? content.substring(0, 47) + '...' : content.trim())
-            : `Sent a ${messageType}`,
-          data: {
-            type: 'chat_message',
-            contactId: req.contactId,
-            messageId: messageId,
-            timestamp: new Date().toISOString(),
-            priority: priority
-          },
-          token: recipientData.fcmToken,
-          priority: priority === 'high' ? 'high' : 'normal'
-        };
-
-        const notificationResult = await notificationService.sendNotification(notificationData);
-        notificationSent = notificationResult.success;
-        
-        if (ENABLE_METRICS) {
-          notificationsSent.labels(
-            recipientData.platform || 'unknown', 
-            notificationResult.success ? 'success' : 'failed',
-            'chat_message'
-          ).inc();
-        }
-        
-        console.log(`🔔 Push notification ${notificationResult.success ? 'sent' : 'failed'} to ${recipientContactId}`);
-      } catch (notifError) {
-        console.error('❌ Failed to send push notification:', notifError);
-        if (ENABLE_METRICS) {
-          notificationsSent.labels(recipientData.platform || 'unknown', 'error', 'chat_message').inc();
-        }
+    // ✅ NEW CODE: Send push notification via Expo if recipient is offline or not on silent mode
+if ((!recipientOnline || !silent) && !recipientData.notificationsDisabled) {
+  // ✅ Support both Expo and legacy FCM tokens
+  const pushToken = recipientData.expoPushToken || recipientData.fcmToken;
+  
+  if (pushToken) {
+    try {
+      const notificationData = {
+        title: req.profile.displayName || req.contactId,
+        body: messageType === 'text' 
+          ? (content.length > 50 ? content.substring(0, 47) + '...' : content.trim())
+          : `Sent a ${messageType}`,
+        data: {
+          type: 'chat_message',
+          contactId: req.contactId,
+          messageId: messageId,
+          timestamp: new Date().toISOString(),
+          priority: priority
+        },
+        token: pushToken, // ✅ Use combined token
+        priority: priority === 'high' ? 'high' : 'normal'
+      };
+      
+      const notificationResult = await notificationService.sendNotification(notificationData);
+      notificationSent = notificationResult.success;
+      
+      if (ENABLE_METRICS) {
+        notificationsSent.labels(
+          recipientData.platform || 'unknown', 
+          notificationResult.success ? 'success' : 'failed',
+          'chat_message'
+        ).inc();
+      }
+      
+      console.log(`🔔 Expo notification ${notificationResult.success ? 'sent' : 'failed'} to ${recipientContactId}`);
+    } catch (notifError) {
+      console.error('❌ Failed to send Expo notification:', notifError);
+      if (ENABLE_METRICS) {
+        notificationsSent.labels(recipientData.platform || 'unknown', 'error', 'chat_message').inc();
       }
     }
+  } else {
+    console.log(`⚠️ No push token found for recipient: ${recipientContactId}`);
+  }
+}
 
     if (ENABLE_METRICS) {
       totalMessages.labels(messageType, 'success', req.platform || 'unknown').inc();
@@ -819,52 +827,117 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
   }
 });
 
-// ✅ Enhanced Notification Endpoints
+// ✅ NEW CODE
 app.post('/api/notifications/register', authenticate, async (req, res) => {
-  const { fcmToken, platform, deviceId, appVersion } = req.body;
+  const { fcmToken: expoPushToken, platform, deviceId, appVersion } = req.body; // ✅ Changed
   
-  if (!fcmToken) {
-    return res.status(400).json({ error: 'FCM token required', code: 'MISSING_TOKEN' });
+  if (!expoPushToken) {
+    return res.status(400).json({ 
+      error: 'Expo push token is required',
+      expectedFormat: 'ExponentPushToken[...]'
+    });
+  }
+
+  // ✅ ADD: Validate Expo token format
+  if (!Expo.isExpoPushToken(expoPushToken)) {
+    return res.status(400).json({ 
+      error: 'Invalid Expo push token format',
+      received: expoPushToken?.substring(0, 30) + '...',
+      expectedFormat: 'ExponentPushToken[...]'
+    });
+  }
+// ✅ NEW CODE  
+await updateDoc(userRef, {
+  expoPushToken: expoPushToken,  // ✅ New field name
+  fcmToken: expoPushToken,       // ✅ Keep for backward compatibility
+  platform,
+  tokenProvider: 'expo',         // ✅ Mark as using Expo
+  // ... other existing fields
+});
+// ✅ NEW CODE: Send Custom Notification Endpoint
+app.post('/api/notifications/send', authenticate, async (req, res) => {
+  const { targetContactId, title, body, data = {}, priority = 'normal' } = req.body;
+  
+  // Validate required fields
+  if (!targetContactId || !title || !body) {
+    return res.status(400).json({ 
+      error: 'targetContactId, title, and body are required',
+      received: { targetContactId, title: !!title, body: !!body }
+    });
   }
 
   try {
-    // Validate token before storing
-    const validation = await notificationService.validateToken(fcmToken, req.userId);
-    
-    if (!validation.isValid) {
-      return res.status(400).json({ 
-        error: 'Invalid FCM token',
-        code: 'INVALID_TOKEN',
-        reason: validation.reason 
+    // ✅ Find target user by contactId
+    const targetUser = await getUserByContactId(targetContactId);
+    if (!targetUser) {
+      return res.status(404).json({ 
+        error: 'Target user not found',
+        contactId: targetContactId
       });
     }
 
-    await db.collection('users').doc(req.userId).update({
-      fcmToken,
-      platform: platform || 'unknown',
-      deviceId: deviceId || 'unknown',
-      appVersion: appVersion || 'unknown',
-      lastTokenUpdate: FieldValue.serverTimestamp()
-    });
-    
-    if (ENABLE_METRICS) {
-      firebaseOperations.labels('fcm_register', 'success', 'users').inc();
+    // ✅ Get push token (support both Expo and legacy FCM)
+    const pushToken = targetUser.expoPushToken || targetUser.fcmToken;
+    if (!pushToken) {
+      return res.status(400).json({ 
+        error: 'User has no push token registered',
+        userId: targetUser.id
+      });
     }
-    
-    console.log(`🔔 FCM token registered for ${req.contactId}`);
-    res.json({ 
-      success: true, 
-      message: 'FCM token registered successfully',
-      tokenValid: true
+
+    // ✅ Send notification via Expo service
+    const result = await notificationService.sendNotification({
+      token: pushToken,
+      title,
+      body,
+      data: {
+        ...data,
+        type: 'custom_notification',
+        senderContactId: req.contactId,
+        timestamp: new Date().toISOString()
+      },
+      priority
     });
+
+    // ✅ Track metrics if enabled
+    if (ENABLE_METRICS) {
+      notificationsSent.labels(
+        targetUser.platform || 'unknown',
+        result.success ? 'success' : 'failed',
+        'custom_notification'
+      ).inc();
+    }
+
+    console.log(`🔔 Custom notification ${result.success ? 'sent' : 'failed'}: ${req.contactId} -> ${targetContactId}`);
+
+    // ✅ Return comprehensive response
+    res.json({
+      success: result.success,
+      message: result.success ? 'Notification sent successfully' : 'Failed to send notification',
+      provider: 'expo',
+      messageId: result.messageId,
+      targetContactId,
+      timestamp: new Date().toISOString(),
+      error: result.success ? undefined : result.error
+    });
+
   } catch (error) {
-    console.error('❌ Error registering FCM token:', error);
+    console.error('❌ Custom notification error:', error);
+    
+    // ✅ Track error metrics
     if (ENABLE_METRICS) {
-      firebaseOperations.labels('fcm_register', 'error', 'users').inc();
+      notificationsSent.labels('unknown', 'error', 'custom_notification').inc();
     }
-    res.status(500).json({ error: 'Failed to register FCM token', code: 'REGISTRATION_FAILED' });
+    
+    res.status(500).json({ 
+      error: 'Failed to send notification',
+      details: error.message,
+      provider: 'expo',
+      timestamp: new Date().toISOString()
+    });
   }
 });
+
 
 app.post('/api/notifications/validate', authenticate, async (req, res) => {
   const { fcmToken } = req.body;
@@ -1513,4 +1586,5 @@ export {
   register,
   notificationService
 };
+
 
