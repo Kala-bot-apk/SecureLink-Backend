@@ -1,6 +1,6 @@
-// services/notificationService.js - BACKEND NODE.JS VERSION
+// services/notificationService.js - ENHANCED BACKEND NODE.JS VERSION
 import { getMessaging } from 'firebase-admin/messaging';
-import { getFirestore, FieldValue } from 'firebase-admin/firestore';
+import { FieldValue } from 'firebase-admin/firestore';
 import { db } from './firebaseAdmin.js';
 
 class NotificationService {
@@ -9,32 +9,41 @@ class NotificationService {
     this.tokenValidationCache = new Map();
     this.rateLimitCache = new Map();
     this.retryQueue = [];
+    this.metrics = {
+      totalSent: 0,
+      totalFailed: 0,
+      totalInvalidTokens: 0,
+      totalRateLimited: 0
+    };
   }
 
-  // ✅ Enhanced notification sending with token validation
+  // ✅ Enhanced notification sending with better error handling
   async sendNotification(notificationData) {
     try {
-      const { token, title, body, data = {} } = notificationData;
+      const { token, title, body, data = {}, priority = 'high' } = notificationData;
       
-      // ✅ Validate token format first
+      // ✅ Enhanced token validation
       if (!this.isValidTokenFormat(token)) {
         console.error('❌ Invalid token format:', token?.substring(0, 20) + '...');
         await this.handleInvalidToken(token, 'invalid_format');
+        this.metrics.totalInvalidTokens++;
         return { success: false, error: 'Invalid token format' };
       }
 
-      // ✅ Check if token is in our invalid tokens cache
+      // ✅ Check blacklisted tokens
       if (this.invalidTokens.has(token)) {
-        console.log('🚫 Skipping notification to known invalid token');
+        console.log('🚫 Skipping notification to blacklisted token');
         return { success: false, error: 'Token previously marked as invalid' };
       }
 
       // ✅ Rate limiting check
       if (this.isRateLimited(token)) {
         console.warn('⚠️ Rate limiting active for token');
+        this.metrics.totalRateLimited++;
         return { success: false, error: 'Rate limited' };
       }
 
+      // ✅ Build message with enhanced configuration
       const message = {
         token: token,
         notification: {
@@ -44,17 +53,26 @@ class NotificationService {
         data: {
           ...data,
           timestamp: new Date().toISOString(),
+          messageId: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         },
         android: {
-          priority: 'high',
+          priority: priority,
           notification: {
             sound: 'default',
-            priority: 'high',
+            priority: priority,
             defaultSound: true,
             channelId: 'default',
+            clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+          },
+          data: {
+            ...data,
+            click_action: 'FLUTTER_NOTIFICATION_CLICK',
           },
         },
         apns: {
+          headers: {
+            'apns-priority': priority === 'high' ? '10' : '5',
+          },
           payload: {
             aps: {
               alert: {
@@ -63,7 +81,21 @@ class NotificationService {
               },
               sound: 'default',
               badge: 1,
+              'content-available': 1,
             },
+            ...data,
+          },
+        },
+        webpush: {
+          headers: {
+            Urgency: priority,
+          },
+          notification: {
+            title: title,
+            body: body,
+            icon: data.icon || '/icon-192x192.png',
+            badge: data.badge || '/badge-72x72.png',
+            tag: data.tag || 'default',
           },
         },
       };
@@ -75,15 +107,15 @@ class NotificationService {
       
       console.log('✅ Notification sent successfully:', response);
       
-      // ✅ Mark token as valid in cache
+      // ✅ Update cache and metrics
       this.tokenValidationCache.set(token, {
         isValid: true,
         lastUsed: Date.now(),
         successCount: (this.tokenValidationCache.get(token)?.successCount || 0) + 1
       });
       
-      // Update rate limiting
       this.updateRateLimit(token, true);
+      this.metrics.totalSent++;
       
       return { 
         success: true, 
@@ -99,6 +131,7 @@ class NotificationService {
       
       // Update rate limiting for failed attempts
       this.updateRateLimit(notificationData.token, false);
+      this.metrics.totalFailed++;
       
       return { 
         success: false, 
@@ -108,7 +141,7 @@ class NotificationService {
     }
   }
 
-  // ✅ Validate FCM token format (enhanced for both FCM and Expo tokens)
+  // ✅ Enhanced token format validation
   isValidTokenFormat(token) {
     if (!token || typeof token !== 'string') {
       return false;
@@ -117,25 +150,29 @@ class NotificationService {
     // Clean the token
     token = token.trim();
     
-    // Check for Expo push tokens
+    // Expo push tokens
     if (token.startsWith('ExponentPushToken[')) {
-      const expoTokenRegex = /^ExponentPushToken\[[a-zA-Z0-9_-]+\]$/;
+      const expoTokenRegex = /^ExponentPushToken\[[a-zA-Z0-9_-]{22,}\]$/;
       return expoTokenRegex.test(token);
     }
     
-    // Check for regular FCM tokens
+    // Firebase FCM tokens (contain colons and are longer)
     if (token.includes(':')) {
-      // FCM tokens typically contain colons and are longer
-      const fcmTokenRegex = /^[a-zA-Z0-9:_-]{100,}$/;
+      const fcmTokenRegex = /^[a-zA-Z0-9:_-]{140,}$/;
       return fcmTokenRegex.test(token) && token.length >= 140;
     }
     
-    // General token validation
-    const generalTokenRegex = /^[a-zA-Z0-9_-]{140,200}$/;
+    // APNs tokens (hexadecimal, 64 characters)
+    if (/^[a-fA-F0-9]{64}$/.test(token)) {
+      return true;
+    }
+    
+    // General token validation (fallback)
+    const generalTokenRegex = /^[a-zA-Z0-9_-]{100,200}$/;
     return generalTokenRegex.test(token);
   }
 
-  // ✅ Rate limiting implementation
+  // ✅ Enhanced rate limiting
   isRateLimited(token) {
     const now = Date.now();
     const rateData = this.rateLimitCache.get(token);
@@ -146,7 +183,11 @@ class NotificationService {
     const windowStart = now - 60000; // 1 minute window
     const recentAttempts = rateData.attempts.filter(time => time > windowStart);
     
-    return recentAttempts.length >= 10;
+    // More strict rate limiting for failed tokens
+    const recentFailures = rateData.failures || 0;
+    const maxAttempts = recentFailures > 3 ? 5 : 10;
+    
+    return recentAttempts.length >= maxAttempts;
   }
 
   // ✅ Update rate limiting data
@@ -161,10 +202,15 @@ class NotificationService {
     const oneHourAgo = now - 3600000;
     rateData.attempts = rateData.attempts.filter(time => time > oneHourAgo);
     
+    // Reset failure count if successful
+    if (success && rateData.failures > 0) {
+      rateData.failures = Math.max(0, rateData.failures - 1);
+    }
+    
     this.rateLimitCache.set(token, rateData);
   }
 
-  // ✅ Handle FCM-specific errors
+  // ✅ Enhanced FCM error handling
   async handleFCMError(error, token) {
     const errorCode = error.code || error.errorInfo?.code;
     
@@ -178,12 +224,12 @@ class NotificationService {
         
       case 'messaging/message-rate-exceeded':
         console.warn('⚠️ Message rate exceeded, implementing backoff');
-        await this.handleRateExceeded(token);
+        await this.handleRateExceeded(token, 60000);
         break;
         
       case 'messaging/device-message-rate-exceeded':
         console.warn('⚠️ Device message rate exceeded');
-        await this.handleDeviceRateExceeded(token);
+        await this.handleRateExceeded(token, 300000);
         break;
         
       case 'messaging/topics-message-rate-exceeded':
@@ -192,12 +238,31 @@ class NotificationService {
         
       case 'messaging/internal-error':
       case 'messaging/server-unavailable':
+      case 'messaging/timeout':
         console.warn('⚠️ Temporary error, adding to retry queue');
-        this.addToRetryQueue({ token, error: errorCode });
+        this.addToRetryQueue({ 
+          token, 
+          error: errorCode,
+          originalData: error.originalData 
+        });
+        break;
+        
+      case 'messaging/payload-too-large':
+        console.error('❌ Payload too large:', errorCode);
+        break;
+        
+      case 'messaging/invalid-data-payload-key':
+        console.error('❌ Invalid data payload key:', errorCode);
         break;
         
       default:
         console.error('❌ Unknown FCM error:', errorCode, error.message);
+        // Add unknown errors to retry queue for investigation
+        this.addToRetryQueue({ 
+          token, 
+          error: errorCode || 'unknown_error',
+          errorMessage: error.message 
+        });
     }
   }
 
@@ -217,12 +282,12 @@ class NotificationService {
     }
   }
 
-  // ✅ Clean invalid tokens from Firestore using Firebase Admin SDK
+  // ✅ Clean invalid tokens from Firestore
   async cleanInvalidTokenFromDatabase(invalidToken, reason) {
     try {
       console.log(`🔍 Searching for invalid token in database...`);
       
-      // ✅ Use Firebase Admin SDK methods
+      // Use Firebase Admin SDK methods
       const usersCollection = db.collection('users');
       const snapshot = await usersCollection.where('fcmToken', '==', invalidToken).get();
       
@@ -231,12 +296,11 @@ class NotificationService {
         return;
       }
       
-      // ✅ Use Admin SDK batch operations
+      // Use Admin SDK batch operations
       const batch = db.batch();
       let cleanedCount = 0;
       
       snapshot.forEach(doc => {
-        // ✅ Use FieldValue.delete() from Admin SDK
         batch.update(doc.ref, {
           fcmToken: FieldValue.delete(),
           fcmTokenUpdatedAt: FieldValue.serverTimestamp(),
@@ -255,32 +319,30 @@ class NotificationService {
     }
   }
 
-  // ✅ Handle rate exceeded errors
-  async handleRateExceeded(token) {
-    const backoffTime = 60000; // 1 minute backoff
+  // ✅ Handle rate exceeded errors with exponential backoff
+  async handleRateExceeded(token, baseBackoffTime) {
+    const rateData = this.rateLimitCache.get(token);
+    const backoffMultiplier = rateData?.failures || 1;
+    const backoffTime = Math.min(baseBackoffTime * backoffMultiplier, 600000); // Max 10 minutes
+    
+    console.log(`⏰ Setting backoff for ${token.substring(0, 20)}... for ${backoffTime}ms`);
+    
     setTimeout(() => {
       this.rateLimitCache.delete(token);
     }, backoffTime);
   }
 
-  // ✅ Handle device rate exceeded
-  async handleDeviceRateExceeded(token) {
-    const backoffTime = 300000; // 5 minute backoff
-    setTimeout(() => {
-      this.rateLimitCache.delete(token);
-    }, backoffTime);
-  }
-
-  // ✅ Add to retry queue
+  // ✅ Add to retry queue with better metadata
   addToRetryQueue(item) {
     this.retryQueue.push({
       ...item,
       addedAt: Date.now(),
-      retryCount: 0
+      retryCount: 0,
+      id: `retry_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
     });
   }
 
-  // ✅ Process retry queue
+  // ✅ Enhanced retry queue processing
   async processRetryQueue() {
     const now = Date.now();
     const readyToRetry = this.retryQueue.filter(item => 
@@ -288,35 +350,55 @@ class NotificationService {
       item.retryCount < 3 // Max 3 retries
     );
 
+    console.log(`🔄 Processing ${readyToRetry.length} items from retry queue`);
+
     for (const item of readyToRetry) {
       try {
-        const result = await this.sendNotification({
+        // Use original data if available
+        const notificationData = item.originalData || {
           token: item.token,
           title: 'Retry Notification',
           body: 'Retrying failed notification'
-        });
+        };
+        
+        const result = await this.sendNotification(notificationData);
         
         if (result.success) {
           // Remove from queue
-          this.retryQueue = this.retryQueue.filter(qi => qi !== item);
+          this.retryQueue = this.retryQueue.filter(qi => qi.id !== item.id);
+          console.log(`✅ Retry successful for item ${item.id}`);
         } else {
           item.retryCount++;
+          item.lastRetryAt = now;
         }
       } catch (error) {
         item.retryCount++;
-        console.error('❌ Retry failed:', error);
+        item.lastRetryAt = now;
+        console.error(`❌ Retry failed for item ${item.id}:`, error);
       }
     }
 
-    // Clean up old items
+    // Clean up old items that have exceeded max retries or are too old
+    const before = this.retryQueue.length;
     this.retryQueue = this.retryQueue.filter(item => 
       now - item.addedAt < 3600000 && // Remove after 1 hour
       item.retryCount < 3
     );
+    const cleaned = before - this.retryQueue.length;
+    
+    if (cleaned > 0) {
+      console.log(`🧹 Cleaned ${cleaned} expired retry items`);
+    }
   }
 
-  // ✅ Batch send notifications with enhanced filtering
-  async sendBatchNotifications(notifications) {
+  // ✅ Enhanced batch notifications with better concurrency control
+  async sendBatchNotifications(notifications, options = {}) {
+    const { 
+      batchSize = 10, 
+      delayBetweenBatches = 100,
+      maxConcurrency = 5 
+    } = options;
+    
     const results = [];
     const validNotifications = [];
     
@@ -336,35 +418,56 @@ class NotificationService {
       }
     }
     
-    // Send to valid tokens with concurrency control
-    const BATCH_SIZE = 10; // Process 10 notifications at a time
-    for (let i = 0; i < validNotifications.length; i += BATCH_SIZE) {
-      const batch = validNotifications.slice(i, i + BATCH_SIZE);
-      const batchPromises = batch.map(notification => this.sendNotification(notification));
-      const batchResults = await Promise.allSettled(batchPromises);
+    console.log(`📤 Sending batch of ${validNotifications.length} notifications`);
+    
+    // Process in batches with concurrency control
+    for (let i = 0; i < validNotifications.length; i += batchSize) {
+      const batch = validNotifications.slice(i, i + batchSize);
       
-      batchResults.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          results.push({ ...batch[index], ...result.value });
-        } else {
-          results.push({
-            ...batch[index],
-            success: false,
-            error: result.reason.message || 'Unknown error'
-          });
-        }
-      });
+      // Limit concurrency within each batch
+      const chunks = [];
+      for (let j = 0; j < batch.length; j += maxConcurrency) {
+        chunks.push(batch.slice(j, j + maxConcurrency));
+      }
       
-      // Small delay between batches to avoid overwhelming FCM
-      if (i + BATCH_SIZE < validNotifications.length) {
-        await new Promise(resolve => setTimeout(resolve, 100));
+      for (const chunk of chunks) {
+        const chunkPromises = chunk.map(notification => this.sendNotification(notification));
+        const chunkResults = await Promise.allSettled(chunkPromises);
+        
+        chunkResults.forEach((result, index) => {
+          if (result.status === 'fulfilled') {
+            results.push({ ...chunk[index], ...result.value });
+          } else {
+            results.push({
+              ...chunk[index],
+              success: false,
+              error: result.reason.message || 'Unknown error'
+            });
+          }
+        });
+      }
+      
+      // Delay between batches to avoid overwhelming FCM
+      if (i + batchSize < validNotifications.length) {
+        await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
       }
     }
     
-    return results;
+    console.log(`✅ Batch completed: ${results.filter(r => r.success).length} succeeded, ${results.filter(r => !r.success).length} failed`);
+    
+    return {
+      results,
+      summary: {
+        total: notifications.length,
+        valid: validNotifications.length,
+        succeeded: results.filter(r => r.success).length,
+        failed: results.filter(r => !r.success).length,
+        timestamp: new Date().toISOString()
+      }
+    };
   }
 
-  // ✅ Validate token with dry run
+  // ✅ Enhanced token validation with dry run
   async validateToken(token, userId) {
     try {
       if (!this.isValidTokenFormat(token)) {
@@ -374,10 +477,10 @@ class NotificationService {
       // Check cache first
       const cached = this.tokenValidationCache.get(token);
       if (cached && (Date.now() - cached.lastUsed) < 24 * 60 * 60 * 1000) {
-        return { isValid: cached.isValid, reason: 'cached' };
+        return { isValid: cached.isValid, reason: 'cached', lastUsed: cached.lastUsed };
       }
       
-      // ✅ Test token with a dry run using Admin SDK
+      // Test token with a dry run using Admin SDK
       const testMessage = {
         token: token,
         data: { 
@@ -399,7 +502,8 @@ class NotificationService {
       return { 
         isValid: true, 
         reason: 'validated',
-        messageId: response 
+        messageId: response,
+        timestamp: new Date().toISOString()
       };
       
     } catch (error) {
@@ -417,7 +521,7 @@ class NotificationService {
     }
   }
 
-  // ✅ Enhanced periodic cleanup
+  // ✅ Enhanced periodic cleanup with metrics
   async performTokenCleanup() {
     try {
       console.log('🧹 Starting comprehensive token cleanup...');
@@ -438,10 +542,10 @@ class NotificationService {
       let cleanedRateLimit = 0;
       for (const [token, data] of this.rateLimitCache.entries()) {
         const recentAttempts = data.attempts.filter(time => time > oneDayAgo);
-        if (recentAttempts.length === 0) {
+        if (recentAttempts.length === 0 && data.failures === 0) {
           this.rateLimitCache.delete(token);
           cleanedRateLimit++;
-        } else {
+        } else if (recentAttempts.length > 0) {
           // Update with filtered attempts
           this.rateLimitCache.set(token, {
             ...data,
@@ -459,74 +563,134 @@ class NotificationService {
       
       console.log(`✅ Cleanup completed: ${cleanedValidation} validation cache, ${cleanedRateLimit} rate limit cache, ${invalidTokensCleared} invalid tokens cleared`);
       
+      return {
+        validationCacheCleaned: cleanedValidation,
+        rateLimitCacheCleaned: cleanedRateLimit,
+        invalidTokensCleared: invalidTokensCleared,
+        timestamp: new Date().toISOString()
+      };
+      
     } catch (error) {
       console.error('❌ Error during token cleanup:', error);
+      return { error: error.message, timestamp: new Date().toISOString() };
     }
   }
 
-  // ✅ Enhanced service status
+  // ✅ Enhanced service status with more metrics
   getServiceStatus() {
     const now = Date.now();
     
+    // Calculate healthy tokens
+    const healthyTokensCount = Array.from(this.tokenValidationCache.values())
+      .filter(data => data.isValid && (now - data.lastUsed) < 86400000).length;
+    
+    // Calculate average validation age
+    const validations = Array.from(this.tokenValidationCache.values());
+    const averageValidationAge = validations.length > 0 
+      ? Math.round(validations.reduce((sum, data) => sum + (now - data.lastUsed), 0) / validations.length / 1000)
+      : 0;
+    
     return {
       timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
       caches: {
         invalidTokensCount: this.invalidTokens.size,
         validationCacheSize: this.tokenValidationCache.size,
         rateLimitCacheSize: this.rateLimitCache.size,
+        healthyTokensCount: healthyTokensCount,
       },
       queues: {
         retryQueueSize: this.retryQueue.length,
         pendingRetries: this.retryQueue.filter(item => item.retryCount < 3).length
       },
-      performance: {
-        averageValidationAge: this.getAverageValidationAge(),
-        healthyTokensCount: Array.from(this.tokenValidationCache.values())
-          .filter(data => data.isValid && (now - data.lastUsed) < 86400000).length
+      metrics: {
+        ...this.metrics,
+        successRate: this.metrics.totalSent + this.metrics.totalFailed > 0 
+          ? ((this.metrics.totalSent / (this.metrics.totalSent + this.metrics.totalFailed)) * 100).toFixed(2) + '%'
+          : '0%',
+        averageValidationAge: averageValidationAge + 's',
       },
       system: {
         nodeVersion: process.version,
-        uptime: process.uptime(),
-        memoryUsage: process.memoryUsage()
+        platform: process.platform,
+        memoryUsage: process.memoryUsage(),
+        loadAverage: process.platform === 'linux' ? process.loadavg() : null,
       }
     };
   }
 
-  // ✅ Get average validation age
-  getAverageValidationAge() {
-    const now = Date.now();
-    const validations = Array.from(this.tokenValidationCache.values());
-    
-    if (validations.length === 0) return 0;
-    
-    const totalAge = validations.reduce((sum, data) => sum + (now - data.lastUsed), 0);
-    return Math.round(totalAge / validations.length / 1000); // Return in seconds
-  }
-
-  // ✅ Health check
+  // ✅ Health check with Firebase connectivity test
   async healthCheck() {
     try {
       // Test Firebase Admin connection
-      const testDoc = await db.collection('_health').doc('test').set({
+      await db.collection('_health').doc('notification_service').set({
         timestamp: FieldValue.serverTimestamp(),
-        service: 'notification-service'
+        service: 'notification-service',
+        status: 'healthy',
+        version: '2.0.0'
       });
+      
+      // Test messaging service
+      const testToken = 'test_token_invalid';
+      try {
+        await getMessaging().send({
+          token: testToken,
+          data: { test: 'health_check' }
+        }, true); // dry run
+      } catch (error) {
+        // Expected to fail with invalid token, but confirms messaging service is working
+        if (error.code !== 'messaging/invalid-registration-token') {
+          throw error;
+        }
+      }
       
       return {
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        firestore: 'connected',
-        messaging: 'available',
+        services: {
+          firestore: 'connected',
+          messaging: 'available',
+          cache: 'operational',
+        },
         ...this.getServiceStatus()
       };
     } catch (error) {
       return {
         status: 'unhealthy',
         error: error.message,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        services: {
+          firestore: 'error',
+          messaging: 'error',
+          cache: 'unknown',
+        }
       };
     }
   }
+
+  // ✅ Reset metrics (useful for monitoring)
+  resetMetrics() {
+    this.metrics = {
+      totalSent: 0,
+      totalFailed: 0,
+      totalInvalidTokens: 0,
+      totalRateLimited: 0
+    };
+    console.log('📊 Metrics reset');
+  }
 }
 
-export default new NotificationService();
+// ✅ Export singleton instance
+const notificationService = new NotificationService();
+
+// ✅ Setup automatic cleanup every hour
+setInterval(() => {
+  notificationService.performTokenCleanup();
+}, 60 * 60 * 1000);
+
+// ✅ Setup retry queue processing every 5 minutes
+setInterval(() => {
+  notificationService.processRetryQueue();
+}, 5 * 60 * 1000);
+
+export default notificationService;
