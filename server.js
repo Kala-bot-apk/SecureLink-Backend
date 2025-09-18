@@ -1574,8 +1574,7 @@ const startServer = async () => {
 // Start the server
 startServer();
 
-// ✅ Export for testing
-export default {
+export{
   app, 
   server, 
   io, 
@@ -1586,6 +1585,7 @@ export default {
   register,
   notificationService
 };
+
 
 
 
