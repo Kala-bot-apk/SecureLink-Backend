@@ -1,4 +1,4 @@
-// server.js
+// server.js - Enhanced Production-Ready Backend
 import express from 'express';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
@@ -8,171 +8,262 @@ import { Server } from 'socket.io';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
-import { admin, db } from './firebaseAdmin.js';
-import { NotificationService } from './services/notificationService.js';
-import client from 'prom-client';
+import fetch from 'node-fetch';
+import compression from 'compression';
+import { admin, db, FieldValue } from './firebaseAdmin.js';
+import notificationService from './services/notificationService.js'; // ✅ Fixed import
+import * as client from 'prom-client';
 
+// Load environment variables
 dotenv.config();
 
+// ✅ Enhanced Configuration
 const app = express();
 const server = createServer(app);
 
-// ✅ FIXED: Configuration for Render deployment
-const HOST = process.env.RENDER_INTERNAL_HOST || '0.0.0.0'; // Must bind to 0.0.0.0 for Render
-const PORT = process.env.PORT || 10000; // Render default is 10000
+// ✅ Production Configuration
+const HOST = process.env.RENDER_INTERNAL_HOST || '0.0.0.0';
+const PORT = process.env.PORT || 10000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
+const IS_PRODUCTION = NODE_ENV === 'production';
+const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS) || 1000;
+const ENABLE_METRICS = process.env.ENABLE_METRICS !== 'false';
 
-// ✅ FIXED: Get external URL for self-ping
+// ✅ External URL helper
 const getExternalUrl = () => {
   if (process.env.RENDER_EXTERNAL_URL) {
-    return process.env.RENDER_EXTERNAL_URL; // Render provides this automatically
+    return process.env.RENDER_EXTERNAL_URL;
   }
-  return `http://localhost:${PORT}`; // Local fallback
+  if (process.env.EXTERNAL_URL) {
+    return process.env.EXTERNAL_URL;
+  }
+  return `http://localhost:${PORT}`;
 };
 
-// Prometheus Metrics Setup
+// ✅ Enhanced Prometheus Metrics Setup
 const register = new client.Registry();
 
-// Collect default Node.js metrics
-client.collectDefaultMetrics({ 
-  register,
-  timeout: 10000,
-  gcDurationBuckets: [0.001, 0.01, 0.1, 1, 2, 5],
-  eventLoopMonitoringPrecision: 10,
-});
+if (ENABLE_METRICS) {
+  // Collect default Node.js metrics
+  client.collectDefaultMetrics({ 
+    register,
+    timeout: 10000,
+    gcDurationBuckets: [0.001, 0.01, 0.1, 1, 2, 5],
+    eventLoopMonitoringPrecision: 10,
+  });
 
-// Custom metrics
-const httpRequestDurationMicroseconds = new client.Histogram({
-  name: 'http_request_duration_ms',
-  help: 'Duration of HTTP requests in ms',
-  labelNames: ['method', 'route', 'status_code'],
-  buckets: [0.1, 5, 15, 50, 100, 200, 300, 400, 500, 1000, 2000, 5000]
-});
+  // Custom metrics
+  const httpRequestDurationMicroseconds = new client.Histogram({
+    name: 'http_request_duration_ms',
+    help: 'Duration of HTTP requests in ms',
+    labelNames: ['method', 'route', 'status_code', 'user_agent'],
+    buckets: [0.1, 5, 15, 50, 100, 200, 300, 400, 500, 1000, 2000, 5000]
+  });
 
-const httpRequestTotal = new client.Counter({
-  name: 'http_requests_total',
-  help: 'Total number of HTTP requests',
-  labelNames: ['method', 'route', 'status_code']
-});
+  const httpRequestTotal = new client.Counter({
+    name: 'http_requests_total',
+    help: 'Total number of HTTP requests',
+    labelNames: ['method', 'route', 'status_code', 'user_agent']
+  });
 
-const activeWebSocketConnections = new client.Gauge({
-  name: 'websocket_connections_active',
-  help: 'Number of active WebSocket connections'
-});
+  const activeWebSocketConnections = new client.Gauge({
+    name: 'websocket_connections_active',
+    help: 'Number of active WebSocket connections'
+  });
 
-const totalMessages = new client.Counter({
-  name: 'chat_messages_total',
-  help: 'Total number of chat messages sent',
-  labelNames: ['message_type', 'status']
-});
+  const totalMessages = new client.Counter({
+    name: 'chat_messages_total',
+    help: 'Total number of chat messages sent',
+    labelNames: ['message_type', 'status', 'sender_platform']
+  });
 
-const notificationsSent = new client.Counter({
-  name: 'notifications_sent_total',
-  help: 'Total number of push notifications sent',
-  labelNames: ['platform', 'status']
-});
+  const notificationsSent = new client.Counter({
+    name: 'notifications_sent_total',
+    help: 'Total number of push notifications sent',
+    labelNames: ['platform', 'status', 'notification_type']
+  });
 
-const authenticationAttempts = new client.Counter({
-  name: 'authentication_attempts_total',
-  help: 'Total number of authentication attempts',
-  labelNames: ['method', 'status']
-});
+  const authenticationAttempts = new client.Counter({
+    name: 'authentication_attempts_total',
+    help: 'Total number of authentication attempts',
+    labelNames: ['method', 'status', 'failure_reason']
+  });
 
-const firebaseOperations = new client.Counter({
-  name: 'firebase_operations_total',
-  help: 'Total number of Firebase operations',
-  labelNames: ['operation_type', 'status']
-});
+  const firebaseOperations = new client.Counter({
+    name: 'firebase_operations_total',
+    help: 'Total number of Firebase operations',
+    labelNames: ['operation_type', 'status', 'collection']
+  });
 
-// Register custom metrics
-register.registerMetric(httpRequestDurationMicroseconds);
-register.registerMetric(httpRequestTotal);
-register.registerMetric(activeWebSocketConnections);
-register.registerMetric(totalMessages);
-register.registerMetric(notificationsSent);
-register.registerMetric(authenticationAttempts);
-register.registerMetric(firebaseOperations);
+  const connectionErrors = new client.Counter({
+    name: 'connection_errors_total',
+    help: 'Total number of connection errors',
+    labelNames: ['error_type', 'source']
+  });
 
-// Socket.io setup
+  const resourceUsage = new client.Gauge({
+    name: 'resource_usage',
+    help: 'System resource usage',
+    labelNames: ['resource_type']
+  });
+
+  // Register metrics
+  [httpRequestDurationMicroseconds, httpRequestTotal, activeWebSocketConnections, 
+   totalMessages, notificationsSent, authenticationAttempts, firebaseOperations, 
+   connectionErrors, resourceUsage].forEach(metric => register.registerMetric(metric));
+}
+
+// ✅ Enhanced Socket.io Configuration
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: IS_PRODUCTION ? process.env.ALLOWED_ORIGINS?.split(',') || "*" : "*",
     methods: ["GET", "POST"],
     credentials: false
   },
   transports: ['websocket', 'polling'],
   pingTimeout: 60000,
-  pingInterval: 25000
+  pingInterval: 25000,
+  maxHttpBufferSize: 1e6, // 1MB
+  allowEIO3: true,
+  connectTimeout: 45000,
+  upgradeTimeout: 30000
 });
 
-// Initialize Notification Service
-const notificationService = new NotificationService();
-
-// Security middleware
+// ✅ Enhanced Security Middleware
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
-  contentSecurityPolicy: false
+  contentSecurityPolicy: IS_PRODUCTION ? {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'", "wss:", "https:"],
+    }
+  } : false,
+  hsts: IS_PRODUCTION ? {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  } : false
 }));
 
+// ✅ Enhanced CORS Configuration
 app.use(cors({
-  origin: "*",
+  origin: IS_PRODUCTION ? (origin, callback) => {
+    const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || ['*'];
+    if (allowedOrigins.includes('*') || !origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  } : "*",
   credentials: false,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-API-Key', 'User-Agent'],
+  maxAge: 86400 // 24 hours
 }));
 
-app.use(bodyParser.json({ limit: '10mb' }));
-app.use(bodyParser.urlencoded({ extended: true }));
+// ✅ Compression and Body Parsing
+app.use(compression());
+app.use(bodyParser.json({ 
+  limit: '10mb',
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
+app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
-// Prometheus metrics middleware
+// ✅ Enhanced Request Logging and Metrics
 app.use((req, res, next) => {
   const start = Date.now();
+  const userAgent = req.get('User-Agent') || 'unknown';
+  
+  // Log request
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - ${req.ip} - ${userAgent}`);
   
   res.on('finish', () => {
     const responseTimeInMs = Date.now() - start;
-    const route = req.route ? req.route.path : req.path;
+    const route = req.route?.path || req.path;
     
-    httpRequestDurationMicroseconds
-      .labels(req.method, route, res.statusCode.toString())
-      .observe(responseTimeInMs);
+    if (ENABLE_METRICS) {
+      httpRequestDurationMicroseconds
+        .labels(req.method, route, res.statusCode.toString(), userAgent.split('/')[0])
+        .observe(responseTimeInMs);
+      
+      httpRequestTotal
+        .labels(req.method, route, res.statusCode.toString(), userAgent.split('/')[0])
+        .inc();
+    }
     
-    httpRequestTotal
-      .labels(req.method, route, res.statusCode.toString())
-      .inc();
+    // Log slow requests
+    if (responseTimeInMs > 1000) {
+      console.warn(`🐌 Slow request: ${req.method} ${req.path} took ${responseTimeInMs}ms`);
+    }
   });
   
   next();
 });
 
-// Enhanced rate limiting
-const createRateLimiter = (windowMs, max, message) => rateLimit({
-  windowMs,
-  max,
-  message: { error: message },
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req, res) => {
-    console.warn(`⚠️ Rate limit exceeded for IP: ${req.ip}`);
-    res.status(429).json({ error: message });
-  }
-});
+// ✅ Enhanced Rate Limiting with IP whitelist
+const createRateLimiter = (windowMs, max, message, skipWhitelist = []) => {
+  return rateLimit({
+    windowMs,
+    max,
+    message: { error: message, code: 'RATE_LIMITED' },
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => {
+      // Skip rate limiting for whitelisted IPs
+      const clientIp = req.ip || req.connection.remoteAddress;
+      return skipWhitelist.some(ip => clientIp.includes(ip));
+    },
+    handler: (req, res) => {
+      console.warn(`⚠️ Rate limit exceeded for IP: ${req.ip}, path: ${req.path}`);
+      if (ENABLE_METRICS) {
+        connectionErrors.labels('rate_limit', 'http').inc();
+      }
+      res.status(429).json({ error: message, code: 'RATE_LIMITED', retryAfter: Math.ceil(windowMs / 1000) });
+    },
+    keyGenerator: (req) => {
+      return req.ip + ':' + req.path;
+    }
+  });
+};
 
-app.use('/api/auth', createRateLimiter(15 * 60 * 1000, 10, 'Too many auth requests'));
-app.use('/api/chat/send', createRateLimiter(1 * 60 * 1000, 60, 'Too many messages'));
+// Apply rate limiting
+const whitelistedIPs = process.env.WHITELISTED_IPS?.split(',') || [];
+app.use('/api/auth', createRateLimiter(15 * 60 * 1000, 10, 'Too many authentication requests', whitelistedIPs));
+app.use('/api/chat/send', createRateLimiter(1 * 60 * 1000, 60, 'Too many messages sent'));
 app.use('/api/notifications', createRateLimiter(1 * 60 * 1000, 30, 'Too many notification requests'));
-app.use('/api', createRateLimiter(1 * 60 * 1000, 200, 'Too many requests'));
+app.use('/api', createRateLimiter(1 * 60 * 1000, 200, 'Too many API requests'));
 
-// Session management
+// ✅ Connection Management
 const activeConnections = new Map();
 const socketToUser = new Map();
 const contactToUser = new Map();
+const connectionStats = {
+  totalConnections: 0,
+  currentConnections: 0,
+  peakConnections: 0,
+  lastReset: Date.now()
+};
 
-// Enhanced authentication middleware
+// ✅ Enhanced Authentication Middleware
 async function authenticate(req, res, next) {
   const authHeader = req.headers.authorization;
-
+  const apiKey = req.headers['x-api-key'];
+  
+  // Check for API key authentication (for server-to-server)
+  if (apiKey && process.env.API_KEYS?.split(',').includes(apiKey)) {
+    req.isApiKey = true;
+    return next();
+  }
+  
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    authenticationAttempts.labels('bearer_token', 'missing_header').inc();
+    if (ENABLE_METRICS) {
+      authenticationAttempts.labels('bearer_token', 'failed', 'missing_header').inc();
+    }
     return res.status(401).json({ 
       error: 'Authorization header required',
       code: 'AUTH_HEADER_MISSING'
@@ -180,9 +271,10 @@ async function authenticate(req, res, next) {
   }
 
   const token = authHeader.split(' ')[1];
-
   if (!token) {
-    authenticationAttempts.labels('bearer_token', 'missing_token').inc();
+    if (ENABLE_METRICS) {
+      authenticationAttempts.labels('bearer_token', 'failed', 'missing_token').inc();
+    }
     return res.status(401).json({ 
       error: 'Token missing',
       code: 'TOKEN_MISSING'
@@ -190,44 +282,65 @@ async function authenticate(req, res, next) {
   }
 
   try {
-    const decodedToken = await admin.auth().verifyIdToken(token);
+    // Verify Firebase ID token
+    const decodedToken = await admin.auth().verifyIdToken(token, true); // Check revoked tokens
     req.user = decodedToken;
     req.userId = decodedToken.uid;
-
+    
+    // Get user profile from Firestore
     const userDoc = await db.collection('users').doc(req.userId).get();
-    firebaseOperations.labels('user_fetch', 'success').inc();
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('user_fetch', 'success', 'users').inc();
+    }
     
     if (!userDoc.exists) {
-      authenticationAttempts.labels('bearer_token', 'user_not_found').inc();
+      if (ENABLE_METRICS) {
+        authenticationAttempts.labels('bearer_token', 'failed', 'user_not_found').inc();
+      }
       return res.status(404).json({ 
         error: 'User profile not found',
         code: 'USER_NOT_FOUND'
       });
     }
     
-    req.profile = userDoc.data();
-    req.contactId = req.profile.contactId;
-
+    const profileData = userDoc.data();
+    req.profile = profileData;
+    req.contactId = profileData.contactId || req.userId;
+    
+    // Update user activity
     await updateUserActivity(req.userId);
     
-    authenticationAttempts.labels('bearer_token', 'success').inc();
+    if (ENABLE_METRICS) {
+      authenticationAttempts.labels('bearer_token', 'success', 'valid').inc();
+    }
     next();
   } catch (error) {
     console.error('❌ Authentication error:', error);
-    firebaseOperations.labels('auth_verify', 'error').inc();
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('auth_verify', 'error', 'auth').inc();
+    }
     
     let errorMessage = 'Invalid or expired token';
     let errorCode = 'TOKEN_INVALID';
+    let failureReason = 'invalid_token';
     
     if (error.code === 'auth/id-token-expired') {
       errorMessage = 'Token expired';
       errorCode = 'TOKEN_EXPIRED';
+      failureReason = 'expired_token';
+    } else if (error.code === 'auth/id-token-revoked') {
+      errorMessage = 'Token revoked';
+      errorCode = 'TOKEN_REVOKED';
+      failureReason = 'revoked_token';
     } else if (error.code === 'auth/argument-error') {
       errorMessage = 'Invalid token format';
       errorCode = 'TOKEN_FORMAT_INVALID';
+      failureReason = 'format_invalid';
     }
     
-    authenticationAttempts.labels('bearer_token', 'failed').inc();
+    if (ENABLE_METRICS) {
+      authenticationAttempts.labels('bearer_token', 'failed', failureReason).inc();
+    }
     return res.status(401).json({ 
       error: errorMessage,
       code: errorCode
@@ -235,114 +348,216 @@ async function authenticate(req, res, next) {
   }
 }
 
-// Helper function to update user activity
+// ✅ Enhanced Helper Functions
 async function updateUserActivity(userId) {
   try {
     await db.collection('users').doc(userId).update({
-      lastActive: admin.firestore.FieldValue.serverTimestamp()
+      lastActive: FieldValue.serverTimestamp(),
+      lastActiveIP: null, // Don't store IP for privacy
+      lastActiveUserAgent: null // Don't store user agent for privacy
     });
-    firebaseOperations.labels('user_update', 'success').inc();
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('user_update', 'success', 'users').inc();
+    }
   } catch (error) {
     console.error('❌ Error updating user activity:', error);
-    firebaseOperations.labels('user_update', 'error').inc();
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('user_update', 'error', 'users').inc();
+    }
   }
 }
 
-// Helper function to find user by contactId
 async function findUserByContactId(contactId) {
   try {
+    // First check cache
+    const cachedUserId = contactToUser.get(contactId);
+    if (cachedUserId) {
+      const userDoc = await db.collection('users').doc(cachedUserId).get();
+      if (userDoc.exists) {
+        return {
+          id: cachedUserId,
+          data: userDoc.data()
+        };
+      } else {
+        // Remove from cache if user doesn't exist
+        contactToUser.delete(contactId);
+      }
+    }
+    
+    // Query Firestore
     const userQuery = await db.collection('users')
       .where('contactId', '==', contactId)
       .limit(1)
       .get();
     
-    firebaseOperations.labels('user_query', 'success').inc();
-    return userQuery.empty ? null : {
-      id: userQuery.docs[0].id,
-      data: userQuery.docs[0].data()
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('user_query', 'success', 'users').inc();
+    }
+    
+    if (userQuery.empty) {
+      return null;
+    }
+    
+    const userDoc = userQuery.docs[0];
+    const result = {
+      id: userDoc.id,
+      data: userDoc.data()
     };
+    
+    // Cache the result
+    contactToUser.set(contactId, userDoc.id);
+    
+    return result;
   } catch (error) {
     console.error('❌ Error finding user by contactId:', error);
-    firebaseOperations.labels('user_query', 'error').inc();
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('user_query', 'error', 'users').inc();
+    }
     return null;
   }
 }
 
-// API Routes
+// ✅ Enhanced API Routes
 
-// Prometheus metrics endpoint
-app.get('/metrics', async (req, res) => {
+// Health check endpoint with comprehensive status
+app.get('/api/health', async (req, res) => {
   try {
-    res.set('Content-Type', register.contentType);
-    const metrics = await register.metrics();
-    res.end(metrics);
+    const healthStatus = {
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      environment: NODE_ENV,
+      version: process.env.npm_package_version || '1.0.0',
+      uptime: Math.floor(process.uptime()),
+      host: HOST,
+      port: PORT,
+      connections: {
+        active: activeConnections.size,
+        peak: connectionStats.peakConnections,
+        total: connectionStats.totalConnections
+      },
+      services: {
+        notifications: 'enabled',
+        metrics: ENABLE_METRICS ? 'enabled' : 'disabled',
+        compression: 'enabled',
+        rateLimit: 'enabled'
+      },
+      memory: process.memoryUsage(),
+      performance: {
+        nodeVersion: process.version,
+        platform: process.platform,
+        loadAverage: process.loadavg ? process.loadavg() : null
+      }
+    };
+
+    // Test Firebase connection
+    try {
+      await db.collection('_health').doc('server').set({
+        lastCheck: FieldValue.serverTimestamp(),
+        status: 'healthy'
+      });
+      healthStatus.firebase = 'connected';
+    } catch (error) {
+      healthStatus.firebase = 'error';
+      healthStatus.firebaseError = error.message;
+    }
+
+    // Test notification service
+    try {
+      const notifStatus = await notificationService.healthCheck();
+      healthStatus.notificationService = notifStatus.status;
+    } catch (error) {
+      healthStatus.notificationService = 'error';
+    }
+
+    res.json(healthStatus);
   } catch (error) {
-    console.error('❌ Error generating metrics:', error);
-    res.status(500).end(error.toString());
+    res.status(500).json({
+      status: 'unhealthy',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
-    timestamp: new Date().toISOString(),
-    activeConnections: activeConnections.size,
-    environment: NODE_ENV,
-    host: HOST,
-    port: PORT,
-    version: '1.0.0',
-    uptime: process.uptime(),
-    notifications: 'enabled',
-    metrics: 'enabled'
+// Metrics endpoint
+if (ENABLE_METRICS) {
+  app.get('/metrics', async (req, res) => {
+    try {
+      // Update resource usage metrics
+      const memUsage = process.memoryUsage();
+      resourceUsage.labels('memory_rss').set(memUsage.rss);
+      resourceUsage.labels('memory_heap_used').set(memUsage.heapUsed);
+      resourceUsage.labels('memory_heap_total').set(memUsage.heapTotal);
+      resourceUsage.labels('uptime').set(process.uptime());
+      
+      res.set('Content-Type', register.contentType);
+      const metrics = await register.metrics();
+      res.end(metrics);
+    } catch (error) {
+      console.error('❌ Error generating metrics:', error);
+      res.status(500).end(error.toString());
+    }
   });
-});
+}
 
-// Authentication endpoints
+// ✅ Enhanced Authentication Endpoints
 app.post('/api/auth/login', async (req, res) => {
-  const { idToken, contactId, deviceId, fcmToken } = req.body;
-
+  const { idToken, contactId, deviceId, fcmToken, platform } = req.body;
+  
   if (!idToken || !contactId || !deviceId) {
     return res.status(400).json({ 
-      error: 'Missing required fields: idToken, contactId, deviceId' 
+      error: 'Missing required fields: idToken, contactId, deviceId',
+      code: 'MISSING_FIELDS'
     });
   }
 
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
     const userId = decodedToken.uid;
-
+    
     console.log(`🔐 Login: ${userId}, contactId: ${contactId}, device: ${deviceId}`);
 
     const updateData = {
       isOnline: true,
-      lastSeen: admin.firestore.FieldValue.serverTimestamp(),
-      lastActive: admin.firestore.FieldValue.serverTimestamp(),
+      lastSeen: FieldValue.serverTimestamp(),
+      lastActive: FieldValue.serverTimestamp(),
       lastDevice: deviceId,
-      contactId: contactId
+      contactId: contactId,
+      loginCount: FieldValue.increment(1)
     };
 
     if (fcmToken) {
-      updateData.fcmToken = fcmToken;
-      updateData.platform = req.headers['user-agent']?.includes('iPhone') ? 'ios' : 'android';
-      updateData.lastTokenUpdate = admin.firestore.FieldValue.serverTimestamp();
+      // Validate FCM token before storing
+      const tokenValidation = await notificationService.validateToken(fcmToken, userId);
+      if (tokenValidation.isValid) {
+        updateData.fcmToken = fcmToken;
+        updateData.platform = platform || (req.headers['user-agent']?.includes('iPhone') ? 'ios' : 'android');
+        updateData.lastTokenUpdate = FieldValue.serverTimestamp();
+      } else {
+        console.warn(`⚠️ Invalid FCM token provided during login: ${fcmToken.substring(0, 20)}...`);
+      }
     }
 
     await db.collection('users').doc(userId).update(updateData);
-    firebaseOperations.labels('user_login', 'success').inc();
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('user_login', 'success', 'users').inc();
+    }
 
+    // Cache contact to user mapping
     contactToUser.set(contactId, userId);
 
     res.json({ 
       success: true,
       userId,
       contactId,
-      message: 'Login successful'
+      message: 'Login successful',
+      fcmTokenValid: fcmToken ? tokenValidation?.isValid || false : null
     });
-
   } catch (error) {
     console.error('❌ Login error:', error);
-    firebaseOperations.labels('user_login', 'error').inc();
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('user_login', 'error', 'users').inc();
+    }
     return res.status(401).json({ 
       error: 'Invalid Firebase token',
       code: 'INVALID_TOKEN'
@@ -350,26 +565,35 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Enhanced chat message sending with notifications
+// ✅ Enhanced Message Sending Endpoint
 app.post('/api/chat/send', authenticate, async (req, res) => {
-  const { recipientContactId, content, messageType = 'text', silent = false } = req.body;
-
+  const { recipientContactId, content, messageType = 'text', silent = false, priority = 'normal' } = req.body;
+  
   if (!recipientContactId || !content?.trim()) {
     return res.status(400).json({ 
-      error: 'recipientContactId and content are required' 
+      error: 'recipientContactId and content are required',
+      code: 'MISSING_FIELDS'
     });
   }
 
-  if (content.trim().length > 1000) {
+  if (content.trim().length > 5000) {
     return res.status(400).json({ 
-      error: 'Message content too long (max 1000 characters)' 
+      error: 'Message content too long (max 5000 characters)',
+      code: 'CONTENT_TOO_LONG'
+    });
+  }
+
+  // Prevent self-messaging
+  if (recipientContactId === req.contactId) {
+    return res.status(400).json({
+      error: 'Cannot send message to yourself',
+      code: 'INVALID_RECIPIENT'
     });
   }
 
   try {
     const messageId = uuidv4();
-    const timestamp = admin.firestore.FieldValue.serverTimestamp();
-
+    const timestamp = FieldValue.serverTimestamp();
     const messageData = {
       id: messageId,
       senderContactId: req.contactId,
@@ -378,15 +602,21 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
       messageType,
       timestamp,
       status: 'sent',
-      silent
+      silent,
+      priority,
+      edited: false,
+      deleted: false
     };
 
-    console.log(`📨 Message: ${req.contactId} → ${recipientContactId}`);
+    console.log(`📨 Message: ${req.contactId} → ${recipientContactId} (${messageType})`);
 
+    // Find recipient user
     const recipientUser = await findUserByContactId(recipientContactId);
     
     if (!recipientUser) {
-      totalMessages.labels(messageType, 'recipient_not_found').inc();
+      if (ENABLE_METRICS) {
+        totalMessages.labels(messageType, 'recipient_not_found', req.platform || 'unknown').inc();
+      }
       return res.status(404).json({ 
         error: 'Recipient not found',
         code: 'RECIPIENT_NOT_FOUND'
@@ -396,8 +626,10 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
     const recipientUserId = recipientUser.id;
     const recipientData = recipientUser.data;
 
+    // Use batch write for atomicity
     const batch = db.batch();
     
+    // Save message for sender
     const senderChatRef = db.collection('users')
       .doc(req.userId)
       .collection('chats')
@@ -406,6 +638,7 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
       .doc(messageId);
     batch.set(senderChatRef, messageData);
 
+    // Save message for recipient
     const recipientChatRef = db.collection('users')
       .doc(recipientUserId)
       .collection('chats')
@@ -414,6 +647,7 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
       .doc(messageId);
     batch.set(recipientChatRef, messageData);
 
+    // Update sender's chat metadata
     const senderMetaRef = db.collection('users')
       .doc(req.userId)
       .collection('chats')
@@ -425,9 +659,11 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
       lastMessage: content.trim(),
       lastMessageTime: timestamp,
       unreadCount: 0,
-      isOnline: recipientData.isOnline || false
+      isOnline: recipientData.isOnline || false,
+      updatedAt: timestamp
     }, { merge: true });
 
+    // Update recipient's chat metadata
     const recipientMetaRef = db.collection('users')
       .doc(recipientUserId)
       .collection('chats')
@@ -438,53 +674,81 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
       photoURL: req.profile.photoURL || null,
       lastMessage: content.trim(),
       lastMessageTime: timestamp,
-      unreadCount: admin.firestore.FieldValue.increment(1),
-      isOnline: true
+      unreadCount: FieldValue.increment(1),
+      isOnline: true,
+      updatedAt: timestamp
     }, { merge: true });
 
+    // Commit batch
     await batch.commit();
-    firebaseOperations.labels('message_batch', 'success').inc();
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('message_batch', 'success', 'chats').inc();
+    }
 
+    // Real-time delivery via WebSocket
     const recipientConnection = [...activeConnections.values()]
       .find(conn => conn.contactId === recipientContactId);
-
+    
     let recipientOnline = false;
     let notificationSent = false;
 
     if (recipientConnection && recipientConnection.socketId) {
       const recipientSocket = io.sockets.sockets.get(recipientConnection.socketId);
-      if (recipientSocket) {
-        recipientSocket.emit('new_message', messageData);
+      if (recipientSocket && recipientSocket.connected) {
+        recipientSocket.emit('new_message', {
+          ...messageData,
+          timestamp: new Date().toISOString() // Convert to ISO string for JSON
+        });
         recipientOnline = true;
         console.log(`⚡ Real-time delivery: ${recipientContactId}`);
+
+        // Send delivery receipt
+        recipientSocket.emit('message_delivered', { messageId });
       }
     }
 
-    if ((!recipientOnline || !silent) && recipientData.fcmToken) {
+    // Send push notification if recipient is offline or not on silent mode
+    if ((!recipientOnline || !silent) && recipientData.fcmToken && !recipientData.notificationsDisabled) {
       try {
         const notificationData = {
           title: req.profile.displayName || req.contactId,
-          body: messageType === 'text' ? content.trim() : `Sent a ${messageType}`,
+          body: messageType === 'text' 
+            ? (content.length > 50 ? content.substring(0, 47) + '...' : content.trim())
+            : `Sent a ${messageType}`,
           data: {
             type: 'chat_message',
             contactId: req.contactId,
             messageId: messageId,
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            priority: priority
           },
-          token: recipientData.fcmToken
+          token: recipientData.fcmToken,
+          priority: priority === 'high' ? 'high' : 'normal'
         };
 
-        await notificationService.sendNotification(notificationData);
-        notificationSent = true;
-        notificationsSent.labels(recipientData.platform || 'unknown', 'success').inc();
-        console.log(`🔔 Push notification sent to ${recipientContactId}`);
+        const notificationResult = await notificationService.sendNotification(notificationData);
+        notificationSent = notificationResult.success;
+        
+        if (ENABLE_METRICS) {
+          notificationsSent.labels(
+            recipientData.platform || 'unknown', 
+            notificationResult.success ? 'success' : 'failed',
+            'chat_message'
+          ).inc();
+        }
+        
+        console.log(`🔔 Push notification ${notificationResult.success ? 'sent' : 'failed'} to ${recipientContactId}`);
       } catch (notifError) {
         console.error('❌ Failed to send push notification:', notifError);
-        notificationsSent.labels(recipientData.platform || 'unknown', 'error').inc();
+        if (ENABLE_METRICS) {
+          notificationsSent.labels(recipientData.platform || 'unknown', 'error', 'chat_message').inc();
+        }
       }
     }
 
-    totalMessages.labels(messageType, 'success').inc();
+    if (ENABLE_METRICS) {
+      totalMessages.labels(messageType, 'success', req.platform || 'unknown').inc();
+    }
 
     res.json({ 
       success: true,
@@ -492,93 +756,121 @@ app.post('/api/chat/send', authenticate, async (req, res) => {
       timestamp: new Date().toISOString(),
       status: 'sent',
       recipientOnline,
-      notificationSent
+      notificationSent,
+      priority
     });
 
   } catch (error) {
     console.error('❌ Send message error:', error);
-    totalMessages.labels(messageType || 'text', 'error').inc();
-    firebaseOperations.labels('message_batch', 'error').inc();
+    if (ENABLE_METRICS) {
+      totalMessages.labels(messageType || 'text', 'error', req.platform || 'unknown').inc();
+      firebaseOperations.labels('message_batch', 'error', 'chats').inc();
+    }
     res.status(500).json({ 
       error: 'Failed to send message',
-      code: 'MESSAGE_SEND_FAILED'
+      code: 'MESSAGE_SEND_FAILED',
+      messageId: null
     });
   }
 });
 
-// [ALL OTHER API ENDPOINTS - keeping all your existing functionality]
+// ✅ Enhanced Notification Endpoints
 app.post('/api/notifications/register', authenticate, async (req, res) => {
-  const { fcmToken, platform, deviceId } = req.body;
+  const { fcmToken, platform, deviceId, appVersion } = req.body;
+  
+  if (!fcmToken) {
+    return res.status(400).json({ error: 'FCM token required', code: 'MISSING_TOKEN' });
+  }
 
+  try {
+    // Validate token before storing
+    const validation = await notificationService.validateToken(fcmToken, req.userId);
+    
+    if (!validation.isValid) {
+      return res.status(400).json({ 
+        error: 'Invalid FCM token',
+        code: 'INVALID_TOKEN',
+        reason: validation.reason 
+      });
+    }
+
+    await db.collection('users').doc(req.userId).update({
+      fcmToken,
+      platform: platform || 'unknown',
+      deviceId: deviceId || 'unknown',
+      appVersion: appVersion || 'unknown',
+      lastTokenUpdate: FieldValue.serverTimestamp()
+    });
+    
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('fcm_register', 'success', 'users').inc();
+    }
+    
+    console.log(`🔔 FCM token registered for ${req.contactId}`);
+    res.json({ 
+      success: true, 
+      message: 'FCM token registered successfully',
+      tokenValid: true
+    });
+  } catch (error) {
+    console.error('❌ Error registering FCM token:', error);
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('fcm_register', 'error', 'users').inc();
+    }
+    res.status(500).json({ error: 'Failed to register FCM token', code: 'REGISTRATION_FAILED' });
+  }
+});
+
+app.post('/api/notifications/validate', authenticate, async (req, res) => {
+  const { fcmToken } = req.body;
+  
   if (!fcmToken) {
     return res.status(400).json({ error: 'FCM token required' });
   }
 
   try {
-    await db.collection('users').doc(req.userId).update({
-      fcmToken,
-      platform: platform || 'unknown',
-      deviceId: deviceId || 'unknown',
-      lastTokenUpdate: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    firebaseOperations.labels('fcm_register', 'success').inc();
-    console.log(`🔔 FCM token registered for ${req.contactId}`);
-    res.json({ success: true, message: 'FCM token registered successfully' });
-
-  } catch (error) {
-    console.error('❌ Error registering FCM token:', error);
-    firebaseOperations.labels('fcm_register', 'error').inc();
-    res.status(500).json({ error: 'Failed to register FCM token' });
-  }
-});
-
-app.post('/api/notifications/send', authenticate, async (req, res) => {
-  const { targetContactId, title, body, data } = req.body;
-
-  if (!targetContactId || !title || !body) {
-    return res.status(400).json({ error: 'targetContactId, title, and body are required' });
-  }
-
-  try {
-    const targetUser = await findUserByContactId(targetContactId);
-    if (!targetUser || !targetUser.data.fcmToken) {
-      return res.status(404).json({ error: 'Target user not found or no FCM token' });
-    }
-
-    const notificationData = {
-      title,
-      body,
-      data: {
-        ...data,
-        senderContactId: req.contactId,
-        timestamp: new Date().toISOString()
-      },
-      token: targetUser.data.fcmToken
-    };
-
-    await notificationService.sendNotification(notificationData);
-    notificationsSent.labels(targetUser.data.platform || 'unknown', 'success').inc();
+    const validation = await notificationService.validateToken(fcmToken, req.userId);
     
-    console.log(`🔔 Custom notification sent: ${req.contactId} → ${targetContactId}`);
-    res.json({ success: true, message: 'Notification sent successfully' });
-
+    res.json({
+      valid: validation.isValid,
+      reason: validation.reason,
+      timestamp: new Date().toISOString()
+    });
   } catch (error) {
-    console.error('❌ Error sending notification:', error);
-    notificationsSent.labels('unknown', 'error').inc();
-    res.status(500).json({ error: 'Failed to send notification' });
+    console.error('❌ Error validating FCM token:', error);
+    res.status(500).json({ error: 'Token validation failed' });
   }
 });
 
+// ✅ Enhanced Chat Endpoints
 app.get('/api/chats', authenticate, async (req, res) => {
   try {
-    const chatsSnapshot = await db.collection('users')
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+    const offset = parseInt(req.query.offset) || 0;
+
+    let query = db.collection('users')
       .doc(req.userId)
       .collection('chats')
       .orderBy('lastMessageTime', 'desc')
-      .get();
+      .limit(limit);
 
+    if (offset > 0) {
+      const offsetDoc = await db.collection('users')
+        .doc(req.userId)
+        .collection('chats')
+        .orderBy('lastMessageTime', 'desc')
+        .limit(offset)
+        .get();
+      
+      if (!offsetDoc.empty) {
+        const lastDoc = offsetDoc.docs[offsetDoc.docs.length - 1];
+        query = query.startAfter(lastDoc);
+      }
+    }
+
+    const chatsSnapshot = await query.get();
     const chats = [];
+    
     chatsSnapshot.forEach(doc => {
       const chatData = doc.data();
       chats.push({
@@ -586,19 +878,30 @@ app.get('/api/chats', authenticate, async (req, res) => {
         displayName: chatData.displayName || chatData.contactId,
         photoURL: chatData.photoURL,
         lastMessage: chatData.lastMessage || '',
-        lastMessageTime: chatData.lastMessageTime,
+        lastMessageTime: chatData.lastMessageTime?.toDate?.()?.toISOString() || null,
         unreadCount: chatData.unreadCount || 0,
-        isOnline: chatData.isOnline || false
+        isOnline: chatData.isOnline || false,
+        updatedAt: chatData.updatedAt?.toDate?.()?.toISOString() || null
       });
     });
 
-    firebaseOperations.labels('chats_fetch', 'success').inc();
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('chats_fetch', 'success', 'chats').inc();
+    }
+    
     console.log(`📬 Retrieved ${chats.length} chats for ${req.contactId}`);
-    res.json({ chats, count: chats.length });
-
+    
+    res.json({ 
+      chats, 
+      count: chats.length,
+      hasMore: chats.length === limit,
+      offset: offset + chats.length
+    });
   } catch (error) {
     console.error('❌ Get chats error:', error);
-    firebaseOperations.labels('chats_fetch', 'error').inc();
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('chats_fetch', 'error', 'chats').inc();
+    }
     res.status(500).json({ 
       error: 'Failed to fetch chats',
       code: 'CHATS_FETCH_FAILED'
@@ -609,40 +912,54 @@ app.get('/api/chats', authenticate, async (req, res) => {
 app.get('/api/chat/:contactId/messages', authenticate, async (req, res) => {
   const { contactId } = req.params;
   const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+  const before = req.query.before; // Timestamp for pagination
 
   try {
-    const messagesSnapshot = await db.collection('users')
+    let query = db.collection('users')
       .doc(req.userId)
       .collection('chats')
       .doc(contactId)
       .collection('messages')
       .orderBy('timestamp', 'desc')
-      .limit(limit)
-      .get();
+      .limit(limit);
 
+    if (before) {
+      const beforeDate = new Date(before);
+      query = query.where('timestamp', '<', beforeDate);
+    }
+
+    const messagesSnapshot = await query.get();
     const messages = [];
+    
     messagesSnapshot.forEach(doc => {
       const data = doc.data();
       messages.push({
         id: doc.id,
         ...data,
-        timestamp: data.timestamp?.toDate()?.toISOString() || new Date().toISOString()
+        timestamp: data.timestamp?.toDate?.()?.toISOString() || new Date().toISOString()
       });
     });
 
+    // Reverse to get chronological order (oldest first)
     messages.reverse();
 
-    firebaseOperations.labels('messages_fetch', 'success').inc();
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('messages_fetch', 'success', 'messages').inc();
+    }
+    
     console.log(`📬 Retrieved ${messages.length} messages for ${req.contactId} ↔ ${contactId}`);
+    
     res.json({ 
       messages, 
       count: messages.length,
-      hasMore: messages.length === limit
+      hasMore: messages.length === limit,
+      nextBefore: messages.length > 0 ? messages[0].timestamp : null
     });
-
   } catch (error) {
     console.error('❌ Get messages error:', error);
-    firebaseOperations.labels('messages_fetch', 'error').inc();
+    if (ENABLE_METRICS) {
+      firebaseOperations.labels('messages_fetch', 'error', 'messages').inc();
+    }
     res.status(500).json({ 
       error: 'Failed to fetch messages',
       code: 'MESSAGES_FETCH_FAILED'
@@ -650,96 +967,45 @@ app.get('/api/chat/:contactId/messages', authenticate, async (req, res) => {
   }
 });
 
-app.post('/api/chat/delivered/:messageId', authenticate, async (req, res) => {
-  const { messageId } = req.params;
-
-  try {
-    await db.collection('messageStatus').doc(messageId).set({
-      status: 'delivered',
-      deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
-      deliveredBy: req.contactId
-    }, { merge: true });
-
-    firebaseOperations.labels('message_status', 'success').inc();
-    console.log(`✅ Message ${messageId} marked as delivered by ${req.contactId}`);
-    res.json({ status: 'delivered' });
-  } catch (error) {
-    console.error('❌ Mark delivered error:', error);
-    firebaseOperations.labels('message_status', 'error').inc();
-    res.status(500).json({ error: 'Failed to mark as delivered' });
-  }
-});
-
-app.post('/api/chat/read/:messageId', authenticate, async (req, res) => {
-  const { messageId } = req.params;
-
-  try {
-    await db.collection('messageStatus').doc(messageId).set({
-      status: 'read',
-      readAt: admin.firestore.FieldValue.serverTimestamp(),
-      readBy: req.contactId
-    }, { merge: true });
-
-    firebaseOperations.labels('message_status', 'success').inc();
-    console.log(`👁️ Message ${messageId} marked as read by ${req.contactId}`);
-    res.json({ status: 'read' });
-  } catch (error) {
-    console.error('❌ Mark read error:', error);
-    firebaseOperations.labels('message_status', 'error').inc();
-    res.status(500).json({ error: 'Failed to mark as read' });
-  }
-});
-
-app.get('/api/contacts/lookup/:contactId', authenticate, async (req, res) => {
-  const { contactId } = req.params;
-
-  try {
-    const user = await findUserByContactId(contactId);
-    
-    if (!user) {
-      return res.status(404).json({ 
-        error: 'User not found',
-        code: 'USER_NOT_FOUND'
-      });
-    }
-
-    const userData = user.data;
-    const isOnline = [...activeConnections.values()]
-      .some(conn => conn.contactId === contactId);
-
-    res.json({
-      contactId: userData.contactId,
-      displayName: userData.displayName || contactId,
-      photoURL: userData.photoURL,
-      isOnline,
-      lastSeen: userData.lastSeen
-    });
-  } catch (error) {
-    console.error('❌ Lookup contact error:', error);
-    res.status(500).json({ 
-      error: 'Failed to lookup contact',
-      code: 'CONTACT_LOOKUP_FAILED'
-    });
-  }
-});
-
-// WebSocket connection handling
+// ✅ Enhanced WebSocket Connection Handling
 io.on('connection', (socket) => {
   console.log(`🔌 Socket connected: ${socket.id}`);
-  activeWebSocketConnections.inc();
+  connectionStats.totalConnections++;
+  connectionStats.currentConnections = activeConnections.size + 1;
+  
+  if (connectionStats.currentConnections > connectionStats.peakConnections) {
+    connectionStats.peakConnections = connectionStats.currentConnections;
+  }
+  
+  if (ENABLE_METRICS) {
+    activeWebSocketConnections.inc();
+  }
+
+  // Connection timeout
+  const connectionTimeout = setTimeout(() => {
+    if (!socket.authenticated) {
+      console.warn(`⚠️ Socket ${socket.id} authentication timeout`);
+      socket.emit('auth_error', { error: 'Authentication timeout' });
+      socket.disconnect(true);
+    }
+  }, 30000); // 30 second timeout
 
   socket.on('authenticate', async (data) => {
     try {
-      const { token, contactId, deviceId } = data;
+      clearTimeout(connectionTimeout);
+      
+      const { token, contactId, deviceId, appVersion } = data;
       
       if (!token || !contactId) {
         socket.emit('auth_error', { error: 'Token and contactId required' });
         return;
       }
 
+      // Verify Firebase token
       const decodedToken = await admin.auth().verifyIdToken(token);
       const userId = decodedToken.uid;
 
+      // Handle existing connections for this user
       if (activeConnections.has(userId)) {
         const existingConnection = activeConnections.get(userId);
         if (existingConnection.socketId && existingConnection.socketId !== socket.id) {
@@ -752,41 +1018,62 @@ io.on('connection', (socket) => {
         }
       }
 
-      activeConnections.set(userId, { 
+      // Store connection info
+      const connectionInfo = { 
         socketId: socket.id, 
         contactId,
-        deviceId,
+        deviceId: deviceId || 'unknown',
+        appVersion: appVersion || 'unknown',
         lastActive: Date.now(),
-        connectedAt: new Date().toISOString()
-      });
+        connectedAt: new Date().toISOString(),
+        authenticated: true
+      };
+      
+      activeConnections.set(userId, connectionInfo);
       socketToUser.set(socket.id, userId);
       contactToUser.set(contactId, userId);
+      socket.authenticated = true;
+      socket.userId = userId;
+      socket.contactId = contactId;
 
+      // Update user online status
       await db.collection('users').doc(userId).update({
         isOnline: true,
-        lastActive: admin.firestore.FieldValue.serverTimestamp()
+        lastActive: FieldValue.serverTimestamp(),
+        lastConnection: FieldValue.serverTimestamp()
       });
       
-      socket.emit('authenticated', { success: true, contactId });
+      socket.emit('authenticated', { 
+        success: true, 
+        contactId,
+        serverId: socket.id 
+      });
       socket.broadcast.emit('user_online', { contactId });
       
       console.log(`⚡ Socket authenticated: ${contactId} (${socket.id})`);
-
     } catch (error) {
       console.error('❌ Socket authentication error:', error);
+      if (ENABLE_METRICS) {
+        connectionErrors.labels('auth_failed', 'websocket').inc();
+      }
       socket.emit('auth_error', { error: 'Authentication failed' });
       socket.disconnect(true);
     }
   });
 
+  // Enhanced typing indicators
   socket.on('typing_start', (data) => {
     const userId = socketToUser.get(socket.id);
-    if (userId && data.contactId) {
+    if (userId && data.contactId && socket.authenticated) {
       const connection = activeConnections.get(userId);
       if (connection) {
+        // Update last active
+        connection.lastActive = Date.now();
+        
         socket.broadcast.emit('typing_start', { 
           contactId: connection.contactId,
-          targetContactId: data.contactId
+          targetContactId: data.contactId,
+          timestamp: new Date().toISOString()
         });
       }
     }
@@ -794,48 +1081,103 @@ io.on('connection', (socket) => {
 
   socket.on('typing_stop', (data) => {
     const userId = socketToUser.get(socket.id);
-    if (userId && data.contactId) {
+    if (userId && data.contactId && socket.authenticated) {
       const connection = activeConnections.get(userId);
       if (connection) {
         socket.broadcast.emit('typing_stop', { 
           contactId: connection.contactId,
-          targetContactId: data.contactId
+          targetContactId: data.contactId,
+          timestamp: new Date().toISOString()
         });
       }
     }
   });
 
+  // Enhanced message status handling
   socket.on('message_delivered', async (data) => {
-    const { messageId } = data;
-    if (messageId) {
+    const { messageId, contactId } = data;
+    if (messageId && socket.authenticated) {
       try {
+        // Update message status in Firebase
         await db.collection('messageStatus').doc(messageId).set({
           status: 'delivered',
-          deliveredAt: admin.firestore.FieldValue.serverTimestamp()
+          deliveredAt: FieldValue.serverTimestamp(),
+          deliveredBy: socket.contactId
+        }, { merge: true });
+        
+        // Notify sender
+        socket.broadcast.emit('message_status_updated', { 
+          messageId, 
+          status: 'delivered',
+          timestamp: new Date().toISOString()
+        });
+      } catch (error) {
+        console.error('❌ Error updating message delivery status:', error);
+      }
+    }
+  });
+
+  socket.on('message_read', async (data) => {
+    const { messageId, contactId } = data;
+    if (messageId && socket.authenticated) {
+      try {
+        await db.collection('messageStatus').doc(messageId).set({
+          status: 'read',
+          readAt: FieldValue.serverTimestamp(),
+          readBy: socket.contactId
         }, { merge: true });
         
         socket.broadcast.emit('message_status_updated', { 
           messageId, 
-          status: 'delivered' 
+          status: 'read',
+          timestamp: new Date().toISOString()
         });
       } catch (error) {
-        console.error('❌ Error updating message status:', error);
+        console.error('❌ Error updating message read status:', error);
       }
     }
   });
 
+  // Presence heartbeat
+  socket.on('heartbeat', () => {
+    const userId = socketToUser.get(socket.id);
+    if (userId && socket.authenticated) {
+      const connection = activeConnections.get(userId);
+      if (connection) {
+        connection.lastActive = Date.now();
+      }
+      socket.emit('heartbeat_ack', { timestamp: Date.now() });
+    }
+  });
+
+  // Enhanced disconnect handling
   socket.on('disconnect', async (reason) => {
+    console.log(`🔌 Socket disconnected: ${socket.id}, reason: ${reason}`);
+    
+    connectionStats.currentConnections = Math.max(0, activeConnections.size - 1);
+    
+    if (ENABLE_METRICS) {
+      activeWebSocketConnections.dec();
+    }
+
     const userId = socketToUser.get(socket.id);
     if (userId) {
       const connection = activeConnections.get(userId);
-      if (connection) {
+      if (connection && connection.socketId === socket.id) {
         try {
+          // Update user offline status
           await db.collection('users').doc(userId).update({
             isOnline: false,
-            lastSeen: admin.firestore.FieldValue.serverTimestamp()
+            lastSeen: FieldValue.serverTimestamp(),
+            lastDisconnectReason: reason
           });
-
-          socket.broadcast.emit('user_offline', { contactId: connection.contactId });
+          
+          socket.broadcast.emit('user_offline', { 
+            contactId: connection.contactId,
+            lastSeen: new Date().toISOString()
+          });
+          
+          // Clean up connection mappings
           contactToUser.delete(connection.contactId);
         } catch (error) {
           console.error('❌ Error updating offline status:', error);
@@ -844,124 +1186,276 @@ io.on('connection', (socket) => {
       
       activeConnections.delete(userId);
       socketToUser.delete(socket.id);
-      activeWebSocketConnections.dec();
-      
-      console.log(`🔌 Socket disconnected: ${userId} (${socket.id}), reason: ${reason}`);
     }
   });
 
-  socket.on('ping', () => {
-    socket.emit('pong', { timestamp: Date.now() });
+  // Error handling
+  socket.on('error', (error) => {
+    console.error(`❌ Socket error ${socket.id}:`, error);
+    if (ENABLE_METRICS) {
+      connectionErrors.labels('socket_error', 'websocket').inc();
+    }
   });
 });
 
-// Error handling middleware
+// ✅ Enhanced Error Handling Middleware
 app.use((error, req, res, next) => {
   console.error('❌ Unhandled error:', error);
-  res.status(500).json({ 
-    error: 'Internal server error',
-    code: 'INTERNAL_ERROR'
+  
+  if (ENABLE_METRICS) {
+    connectionErrors.labels('unhandled_error', 'http').inc();
+  }
+  
+  // Don't leak error details in production
+  const errorMessage = IS_PRODUCTION ? 'Internal server error' : error.message;
+  const errorStack = IS_PRODUCTION ? undefined : error.stack;
+  
+  res.status(error.status || 500).json({ 
+    error: errorMessage,
+    code: 'INTERNAL_ERROR',
+    stack: errorStack,
+    timestamp: new Date().toISOString()
   });
 });
 
 // 404 handler
 app.use('*', (req, res) => {
+  console.warn(`❌ 404 - Route not found: ${req.method} ${req.originalUrl}`);
   res.status(404).json({ 
     error: 'Route not found',
     code: 'ROUTE_NOT_FOUND',
-    path: req.originalUrl
+    path: req.originalUrl,
+    method: req.method
   });
 });
 
-// ✅ FIXED: Self-ping function for Render deployment
-setInterval(async () => {
-  try {
-    const externalUrl = getExternalUrl();
-    const healthUrl = `${externalUrl}/api/health`;
-    
-    console.log(`🏓 Self-ping to: ${healthUrl}`);
-    
-    const response = await fetch(healthUrl, {
-      method: 'GET',
-      timeout: 10000,
-    });
-    
-    if (response.ok) {
-      console.log('🏓 Self-ping successful');
-    } else {
-      console.warn(`⚠️ Self-ping failed with status: ${response.status}`);
-    }
-  } catch (error) {
-    console.warn(`⚠️ Self-ping error: ${error.message}`);
-  }
-}, 6 * 60 * 1000); // Every 6 minutes
+// ✅ Enhanced Maintenance Functions
 
-// Cleanup inactive connections every 5 minutes
+// Self-ping to prevent sleep (for free hosting services)
+if (process.env.ENABLE_SELF_PING !== 'false') {
+  setInterval(async () => {
+    try {
+      const externalUrl = getExternalUrl();
+      const healthUrl = `${externalUrl}/api/health`;
+      
+      console.log(`🏓 Self-ping to: ${healthUrl}`);
+      
+      const response = await fetch(healthUrl, {
+        method: 'GET',
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'SecureLink-Server-SelfPing/1.0'
+        }
+      });
+      
+      if (response.ok) {
+        console.log('🏓 Self-ping successful');
+      } else {
+        console.warn(`⚠️ Self-ping failed with status: ${response.status}`);
+      }
+    } catch (error) {
+      console.warn(`⚠️ Self-ping error: ${error.message}`);
+    }
+  }, 6 * 60 * 1000); // Every 6 minutes
+}
+
+// Enhanced connection cleanup
 setInterval(() => {
   const now = Date.now();
-  const inactiveThreshold = 10 * 60 * 1000;
-
+  const inactiveThreshold = 15 * 60 * 1000; // 15 minutes
+  let cleanedCount = 0;
+  
   for (const [userId, connection] of activeConnections.entries()) {
     if (now - connection.lastActive > inactiveThreshold) {
       const socket = io.sockets.sockets.get(connection.socketId);
       if (socket) {
+        socket.emit('connection_timeout', { reason: 'Inactive connection' });
         socket.disconnect(true);
       }
       activeConnections.delete(userId);
       socketToUser.delete(connection.socketId);
       contactToUser.delete(connection.contactId);
-      console.log(`🧹 Cleaned up inactive connection: ${connection.contactId}`);
+      cleanedCount++;
     }
   }
-}, 5 * 60 * 1000);
+  
+  if (cleanedCount > 0) {
+    console.log(`🧹 Cleaned up ${cleanedCount} inactive connections`);
+  }
+  
+  connectionStats.currentConnections = activeConnections.size;
+}, 5 * 60 * 1000); // Every 5 minutes
 
-// Update WebSocket connections gauge every minute
+// Update WebSocket connections gauge
+if (ENABLE_METRICS) {
+  setInterval(() => {
+    activeWebSocketConnections.set(activeConnections.size);
+  }, 30 * 1000); // Every 30 seconds
+}
+
+// Periodic notification service cleanup
 setInterval(() => {
-  activeWebSocketConnections.set(activeConnections.size);
-}, 60 * 1000);
+  notificationService.performTokenCleanup();
+}, 60 * 60 * 1000); // Every hour
 
-// ✅ FIXED: Start server with proper host binding for Render
-server.listen(PORT, HOST, () => {
-  console.log(`🚀 SecureLink Server running on http://${HOST}:${PORT}`);
-  console.log(`🌐 External URL: ${getExternalUrl()}`);
-  console.log(`📱 Environment: ${NODE_ENV}`);
-  console.log(`🔔 Push notifications: enabled`);
-  console.log(`⚡ WebSocket: enabled`);
-  console.log(`🛡️ Security: enabled`);
-  console.log(`📊 Prometheus metrics: enabled on /metrics`);
-  console.log(`🏓 Self-ping: enabled (every 6 minutes)`);
-});
+// Memory usage monitoring
+setInterval(() => {
+  const memUsage = process.memoryUsage();
+  const memUsageMB = {
+    rss: Math.round(memUsage.rss / 1024 / 1024),
+    heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024),
+    heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024),
+    external: Math.round(memUsage.external / 1024 / 1024)
+  };
+  
+  if (memUsageMB.heapUsed > 500) { // Warning if heap usage > 500MB
+    console.warn(`⚠️ High memory usage detected:`, memUsageMB);
+  }
+  
+  // Force garbage collection in development
+  if (!IS_PRODUCTION && global.gc) {
+    global.gc();
+  }
+}, 2 * 60 * 1000); // Every 2 minutes
 
-// Graceful shutdown
+// ✅ Enhanced Graceful Shutdown
 const shutdown = async (signal) => {
-  console.log(`\n${signal} received, shutting down gracefully...`);
+  console.log(`\n🛑 ${signal} received, shutting down gracefully...`);
   
-  io.close(() => {
-    console.log('📡 WebSocket server closed');
-  });
-  
-  server.close(() => {
-    console.log('🌐 HTTP server closed');
-    process.exit(0);
-  });
-  
-  setTimeout(() => {
-    console.log('⚠️ Forced shutdown');
+  const shutdownTimeout = setTimeout(() => {
+    console.log('⚠️ Forced shutdown due to timeout');
     process.exit(1);
-  }, 10000);
+  }, 30000); // 30 second timeout
+
+  try {
+    // Stop accepting new connections
+    console.log('📡 Stopping new connections...');
+    server.close();
+
+    // Disconnect all WebSocket connections
+    console.log('🔌 Disconnecting WebSocket clients...');
+    io.emit('server_shutdown', { message: 'Server is shutting down' });
+    
+    // Give clients time to receive the message
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    io.close(() => {
+      console.log('📡 WebSocket server closed');
+    });
+
+    // Update all connected users to offline status
+    console.log('👥 Updating user statuses...');
+    const batch = db.batch();
+    for (const [userId, connection] of activeConnections.entries()) {
+      const userRef = db.collection('users').doc(userId);
+      batch.update(userRef, {
+        isOnline: false,
+        lastSeen: FieldValue.serverTimestamp(),
+        lastDisconnectReason: 'server_shutdown'
+      });
+    }
+    
+    if (activeConnections.size > 0) {
+      await batch.commit();
+      console.log(`✅ Updated ${activeConnections.size} user statuses`);
+    }
+
+    // Clear connection maps
+    activeConnections.clear();
+    socketToUser.clear();
+    contactToUser.clear();
+
+    console.log('✅ Graceful shutdown completed');
+    clearTimeout(shutdownTimeout);
+    process.exit(0);
+    
+  } catch (error) {
+    console.error('❌ Error during shutdown:', error);
+    clearTimeout(shutdownTimeout);
+    process.exit(1);
+  }
 };
 
+// Process signal handlers
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
+// Enhanced uncaught exception handling
 process.on('uncaughtException', (error) => {
   console.error('💥 Uncaught Exception:', error);
-  process.exit(1);
+  if (ENABLE_METRICS) {
+    connectionErrors.labels('uncaught_exception', 'process').inc();
+  }
+  // Give time to log the error, then exit
+  setTimeout(() => process.exit(1), 1000);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('🚫 Unhandled Rejection at:', promise, 'reason:', reason);
-  process.exit(1);
+  if (ENABLE_METRICS) {
+    connectionErrors.labels('unhandled_rejection', 'process').inc();
+  }
+  // Don't exit on unhandled rejection in production, just log it
+  if (!IS_PRODUCTION) {
+    setTimeout(() => process.exit(1), 1000);
+  }
 });
 
-export { io, activeConnections };
+// ✅ Enhanced Server Startup
+const startServer = async () => {
+  try {
+    // Test Firebase connection before starting
+    console.log('🔥 Testing Firebase connection...');
+    await db.collection('_server').doc('startup').set({
+      timestamp: FieldValue.serverTimestamp(),
+      version: process.env.npm_package_version || '1.0.0',
+      environment: NODE_ENV,
+      host: HOST,
+      port: PORT
+    });
+    console.log('✅ Firebase connection successful');
+
+    // Test notification service
+    console.log('🔔 Testing notification service...');
+    const notifHealth = await notificationService.healthCheck();
+    console.log(`✅ Notification service: ${notifHealth.status}`);
+
+    // Start server
+    server.listen(PORT, HOST, () => {
+      console.log('\n🚀 ===== SecureLink Server Started =====');
+      console.log(`🌐 Server URL: http://${HOST}:${PORT}`);
+      console.log(`🌍 External URL: ${getExternalUrl()}`);
+      console.log(`📱 Environment: ${NODE_ENV}`);
+      console.log(`🔔 Push notifications: enabled`);
+      console.log(`⚡ WebSocket: enabled`);
+      console.log(`🛡️ Security: enabled`);
+      console.log(`📊 Prometheus metrics: ${ENABLE_METRICS ? 'enabled on /metrics' : 'disabled'}`);
+      console.log(`🏓 Self-ping: ${process.env.ENABLE_SELF_PING !== 'false' ? 'enabled (every 6 minutes)' : 'disabled'}`);
+      console.log(`🧹 Auto-cleanup: enabled`);
+      console.log(`📈 Max connections: ${MAX_CONNECTIONS}`);
+      console.log('==========================================\n');
+      
+      console.log('🎉 Server is ready to accept connections!');
+    });
+
+  } catch (error) {
+    console.error('💥 Failed to start server:', error);
+    process.exit(1);
+  }
+};
+
+// Start the server
+startServer();
+
+// ✅ Export for testing
+export { 
+  app, 
+  server, 
+  io, 
+  activeConnections, 
+  socketToUser, 
+  contactToUser,
+  connectionStats,
+  register,
+  notificationService
+};
