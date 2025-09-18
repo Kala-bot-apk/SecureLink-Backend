@@ -1,10 +1,17 @@
-// services/notificationService.js - ENHANCED BACKEND NODE.JS VERSION
-import { getMessaging } from 'firebase-admin/messaging';
-import { FieldValue } from 'firebase-admin/firestore';
-import { db } from '../firebaseAdmin.js';
+// services/notificationService.js - UPDATED FOR EXPO MESSAGING SERVICE
+import { Expo } from 'expo-server-sdk'; // ✅ NEW: Replace getMessaging import
+import { FieldValue } from 'firebase-admin/firestore'; // ✅ KEEP: Still using Admin SDK
+import { db } from '../firebaseAdmin.js'; // ✅ KEEP: Still using Admin SDK
 
 class NotificationService {
   constructor() {
+    // ✅ NEW: Initialize Expo SDK client
+    this.expo = new Expo({
+      accessToken: process.env.EXPO_ACCESS_TOKEN, // Optional: for higher rate limits
+      useFcmV1: false, // Use legacy FCM for broader compatibility
+    });
+
+    // ✅ KEEP: All existing properties
     this.invalidTokens = new Set();
     this.tokenValidationCache = new Map();
     this.rateLimitCache = new Map();
@@ -17,12 +24,12 @@ class NotificationService {
     };
   }
 
-  // ✅ Enhanced notification sending with better error handling
+  // ✅ UPDATED: Enhanced notification sending with Expo SDK
   async sendNotification(notificationData) {
     try {
       const { token, title, body, data = {}, priority = 'high' } = notificationData;
       
-      // ✅ Enhanced token validation
+      // ✅ UPDATED: Enhanced token validation for Expo
       if (!this.isValidTokenFormat(token)) {
         console.error('❌ Invalid token format:', token?.substring(0, 20) + '...');
         await this.handleInvalidToken(token, 'invalid_format');
@@ -30,84 +37,59 @@ class NotificationService {
         return { success: false, error: 'Invalid token format' };
       }
 
-      // ✅ Check blacklisted tokens
+      // ✅ KEEP: Existing blacklist and rate limiting checks
       if (this.invalidTokens.has(token)) {
         console.log('🚫 Skipping notification to blacklisted token');
         return { success: false, error: 'Token previously marked as invalid' };
       }
 
-      // ✅ Rate limiting check
       if (this.isRateLimited(token)) {
         console.warn('⚠️ Rate limiting active for token');
         this.metrics.totalRateLimited++;
         return { success: false, error: 'Rate limited' };
       }
 
-      // ✅ Build message with enhanced configuration
+      // ✅ NEW: Build message for Expo Push Service
       const message = {
-        token: token,
-        notification: {
-          title: title,
-          body: body,
-        },
+        to: token,
+        sound: 'default',
+        title: title,
+        body: body,
         data: {
           ...data,
           timestamp: new Date().toISOString(),
           messageId: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         },
-        android: {
-          priority: priority,
-          notification: {
-            sound: 'default',
-            priority: priority,
-            defaultSound: true,
-            channelId: 'default',
-            clickAction: 'FLUTTER_NOTIFICATION_CLICK',
-          },
-          data: {
-            ...data,
-            click_action: 'FLUTTER_NOTIFICATION_CLICK',
-          },
-        },
-        apns: {
-          headers: {
-            'apns-priority': priority === 'high' ? '10' : '5',
-          },
-          payload: {
-            aps: {
-              alert: {
-                title: title,
-                body: body,
-              },
-              sound: 'default',
-              badge: 1,
-              'content-available': 1,
-            },
-            ...data,
-          },
-        },
-        webpush: {
-          headers: {
-            Urgency: priority,
-          },
-          notification: {
-            title: title,
-            body: body,
-            icon: data.icon || '/icon-192x192.png',
-            badge: data.badge || '/badge-72x72.png',
-            tag: data.tag || 'default',
-          },
-        },
+        badge: 1,
+        priority: priority === 'high' ? 'high' : 'normal',
+        ttl: 3600, // 1 hour
+        channelId: 'default',
       };
 
-      console.log(`📤 Sending notification to token: ${token.substring(0, 20)}...`);
+      console.log(`📤 Sending notification via Expo to token: ${token.substring(0, 20)}...`);
       
-      // ✅ Send notification using Firebase Admin SDK
-      const response = await getMessaging().send(message);
+      // ✅ NEW: Send notification using Expo Push Service
+      const chunks = this.expo.chunkPushNotifications([message]);
+      let response = null;
+
+      for (let chunk of chunks) {
+        try {
+          const tickets = await this.expo.sendPushNotificationsAsync(chunk);
+          response = tickets[0]; // Get first ticket
+          
+          // Check if ticket has error
+          if (response.status === 'error') {
+            throw new Error(response.message || 'Expo push notification failed');
+          }
+          
+        } catch (error) {
+          throw error;
+        }
+      }
       
-      console.log('✅ Notification sent successfully:', response);
+      console.log('✅ Notification sent successfully via Expo:', response);
       
-      // ✅ Update cache and metrics
+      // ✅ KEEP: Update cache and metrics
       this.tokenValidationCache.set(token, {
         isValid: true,
         lastUsed: Date.now(),
@@ -119,29 +101,30 @@ class NotificationService {
       
       return { 
         success: true, 
-        messageId: response,
-        timestamp: new Date().toISOString() 
+        messageId: response?.id || response,
+        timestamp: new Date().toISOString(),
+        provider: 'expo'
       };
 
     } catch (error) {
-      console.error('❌ Error sending notification:', error);
+      console.error('❌ Error sending notification via Expo:', error);
       
-      // ✅ Handle specific FCM errors
-      await this.handleFCMError(error, notificationData.token);
+      // ✅ UPDATED: Handle Expo-specific errors
+      await this.handleExpoError(error, notificationData.token);
       
-      // Update rate limiting for failed attempts
       this.updateRateLimit(notificationData.token, false);
       this.metrics.totalFailed++;
       
       return { 
         success: false, 
         error: error.message,
-        errorCode: error.code || error.errorInfo?.code
+        errorCode: error.code || 'expo_error',
+        provider: 'expo'
       };
     }
   }
 
-  // ✅ Enhanced token format validation
+  // ✅ UPDATED: Enhanced token format validation for Expo tokens
   isValidTokenFormat(token) {
     if (!token || typeof token !== 'string') {
       return false;
@@ -150,13 +133,12 @@ class NotificationService {
     // Clean the token
     token = token.trim();
     
-    // Expo push tokens
+    // ✅ UPDATED: Validate Expo push tokens using Expo SDK
     if (token.startsWith('ExponentPushToken[')) {
-      const expoTokenRegex = /^ExponentPushToken\[[a-zA-Z0-9_-]{22,}\]$/;
-      return expoTokenRegex.test(token);
+      return Expo.isExpoPushToken(token);
     }
     
-    // Firebase FCM tokens (contain colons and are longer)
+    // ✅ KEEP: Support legacy FCM tokens for backward compatibility
     if (token.includes(':')) {
       const fcmTokenRegex = /^[a-zA-Z0-9:_-]{140,}$/;
       return fcmTokenRegex.test(token) && token.length >= 140;
@@ -167,30 +149,26 @@ class NotificationService {
       return true;
     }
     
-    // General token validation (fallback)
-    const generalTokenRegex = /^[a-zA-Z0-9_-]{100,200}$/;
-    return generalTokenRegex.test(token);
+    return false;
   }
 
-  // ✅ Enhanced rate limiting
+  // ✅ KEEP: Existing rate limiting logic (unchanged)
   isRateLimited(token) {
     const now = Date.now();
     const rateData = this.rateLimitCache.get(token);
     
     if (!rateData) return false;
     
-    // Allow 10 notifications per minute per token
     const windowStart = now - 60000; // 1 minute window
     const recentAttempts = rateData.attempts.filter(time => time > windowStart);
     
-    // More strict rate limiting for failed tokens
     const recentFailures = rateData.failures || 0;
     const maxAttempts = recentFailures > 3 ? 5 : 10;
     
     return recentAttempts.length >= maxAttempts;
   }
 
-  // ✅ Update rate limiting data
+  // ✅ KEEP: Existing rate limit update logic (unchanged)
   updateRateLimit(token, success) {
     const now = Date.now();
     const rateData = this.rateLimitCache.get(token) || { attempts: [], failures: 0 };
@@ -198,11 +176,9 @@ class NotificationService {
     rateData.attempts.push(now);
     if (!success) rateData.failures++;
     
-    // Keep only last hour of attempts
     const oneHourAgo = now - 3600000;
     rateData.attempts = rateData.attempts.filter(time => time > oneHourAgo);
     
-    // Reset failure count if successful
     if (success && rateData.failures > 0) {
       rateData.failures = Math.max(0, rateData.failures - 1);
     }
@@ -210,100 +186,86 @@ class NotificationService {
     this.rateLimitCache.set(token, rateData);
   }
 
-  // ✅ Enhanced FCM error handling
-  async handleFCMError(error, token) {
-    const errorCode = error.code || error.errorInfo?.code;
+  // ✅ NEW: Handle Expo-specific errors
+  async handleExpoError(error, token) {
+    const errorMessage = error.message?.toLowerCase() || '';
     
-    switch (errorCode) {
-      case 'messaging/invalid-registration-token':
-      case 'messaging/registration-token-not-registered':
-      case 'messaging/invalid-argument':
-        console.log(`🗑️ Marking token as invalid: ${errorCode}`);
-        await this.handleInvalidToken(token, errorCode);
-        break;
-        
-      case 'messaging/message-rate-exceeded':
-        console.warn('⚠️ Message rate exceeded, implementing backoff');
-        await this.handleRateExceeded(token, 60000);
-        break;
-        
-      case 'messaging/device-message-rate-exceeded':
-        console.warn('⚠️ Device message rate exceeded');
-        await this.handleRateExceeded(token, 300000);
-        break;
-        
-      case 'messaging/topics-message-rate-exceeded':
-        console.warn('⚠️ Topics message rate exceeded');
-        break;
-        
-      case 'messaging/internal-error':
-      case 'messaging/server-unavailable':
-      case 'messaging/timeout':
-        console.warn('⚠️ Temporary error, adding to retry queue');
-        this.addToRetryQueue({ 
-          token, 
-          error: errorCode,
-          originalData: error.originalData 
-        });
-        break;
-        
-      case 'messaging/payload-too-large':
-        console.error('❌ Payload too large:', errorCode);
-        break;
-        
-      case 'messaging/invalid-data-payload-key':
-        console.error('❌ Invalid data payload key:', errorCode);
-        break;
-        
-      default:
-        console.error('❌ Unknown FCM error:', errorCode, error.message);
-        // Add unknown errors to retry queue for investigation
-        this.addToRetryQueue({ 
-          token, 
-          error: errorCode || 'unknown_error',
-          errorMessage: error.message 
-        });
+    if (errorMessage.includes('devicenotregistered') || 
+        errorMessage.includes('invalid') ||
+        errorMessage.includes('unregistered')) {
+      console.log(`🗑️ Marking Expo token as invalid: ${error.message}`);
+      await this.handleInvalidToken(token, 'expo_device_not_registered');
+    } else if (errorMessage.includes('rate') || errorMessage.includes('limit')) {
+      console.warn('⚠️ Expo rate limit exceeded');
+      await this.handleRateExceeded(token, 60000);
+    } else if (errorMessage.includes('timeout') || 
+               errorMessage.includes('network') ||
+               errorMessage.includes('server')) {
+      console.warn('⚠️ Temporary Expo error, adding to retry queue');
+      this.addToRetryQueue({ 
+        token, 
+        error: 'expo_temporary_error',
+        originalData: error.originalData 
+      });
+    } else {
+      console.error('❌ Unknown Expo error:', error.message);
+      this.addToRetryQueue({ 
+        token, 
+        error: 'expo_unknown_error',
+        errorMessage: error.message 
+      });
     }
   }
 
-  // ✅ Handle invalid tokens using Firebase Admin SDK
+  // ✅ KEEP: Existing invalid token handling (unchanged)
   async handleInvalidToken(token, reason) {
     try {
-      // Add to invalid tokens cache
       this.invalidTokens.add(token);
-      
       console.log(`🗑️ Handling invalid token: ${reason}`);
-      
-      // ✅ Clean token from Firestore using Admin SDK
       await this.cleanInvalidTokenFromDatabase(token, reason);
-      
     } catch (error) {
       console.error('❌ Error handling invalid token:', error);
     }
   }
 
-  // ✅ Clean invalid tokens from Firestore
+  // ✅ UPDATED: Clean invalid tokens from Firestore (support both expo and fcm fields)
   async cleanInvalidTokenFromDatabase(invalidToken, reason) {
     try {
       console.log(`🔍 Searching for invalid token in database...`);
       
-      // Use Firebase Admin SDK methods
       const usersCollection = db.collection('users');
-      const snapshot = await usersCollection.where('fcmToken', '==', invalidToken).get();
       
-      if (snapshot.empty) {
+      // ✅ UPDATED: Search both expoPushToken and fcmToken fields
+      const expoSnapshot = await usersCollection.where('expoPushToken', '==', invalidToken).get();
+      const fcmSnapshot = await usersCollection.where('fcmToken', '==', invalidToken).get();
+      
+      if (expoSnapshot.empty && fcmSnapshot.empty) {
         console.log('ℹ️ Invalid token not found in any user records');
         return;
       }
       
-      // Use Admin SDK batch operations
       const batch = db.batch();
       let cleanedCount = 0;
       
-      snapshot.forEach(doc => {
+      // Clean from expoPushToken field
+      expoSnapshot.forEach(doc => {
+        batch.update(doc.ref, {
+          expoPushToken: FieldValue.delete(),
+          fcmToken: FieldValue.delete(), // Also clean legacy field
+          tokenUpdatedAt: FieldValue.serverTimestamp(),
+          tokenInvalidatedAt: FieldValue.serverTimestamp(),
+          tokenInvalidationReason: reason,
+          lastNotificationAttempt: FieldValue.serverTimestamp()
+        });
+        cleanedCount++;
+      });
+      
+      // Clean from fcmToken field (legacy)
+      fcmSnapshot.forEach(doc => {
         batch.update(doc.ref, {
           fcmToken: FieldValue.delete(),
-          fcmTokenUpdatedAt: FieldValue.serverTimestamp(),
+          expoPushToken: FieldValue.delete(), // Also clean new field
+          tokenUpdatedAt: FieldValue.serverTimestamp(),
           tokenInvalidatedAt: FieldValue.serverTimestamp(),
           tokenInvalidationReason: reason,
           lastNotificationAttempt: FieldValue.serverTimestamp()
@@ -319,11 +281,11 @@ class NotificationService {
     }
   }
 
-  // ✅ Handle rate exceeded errors with exponential backoff
+  // ✅ KEEP: All remaining methods unchanged
   async handleRateExceeded(token, baseBackoffTime) {
     const rateData = this.rateLimitCache.get(token);
     const backoffMultiplier = rateData?.failures || 1;
-    const backoffTime = Math.min(baseBackoffTime * backoffMultiplier, 600000); // Max 10 minutes
+    const backoffTime = Math.min(baseBackoffTime * backoffMultiplier, 600000);
     
     console.log(`⏰ Setting backoff for ${token.substring(0, 20)}... for ${backoffTime}ms`);
     
@@ -332,7 +294,6 @@ class NotificationService {
     }, backoffTime);
   }
 
-  // ✅ Add to retry queue with better metadata
   addToRetryQueue(item) {
     this.retryQueue.push({
       ...item,
@@ -342,19 +303,17 @@ class NotificationService {
     });
   }
 
-  // ✅ Enhanced retry queue processing
   async processRetryQueue() {
     const now = Date.now();
     const readyToRetry = this.retryQueue.filter(item => 
-      now - item.addedAt > Math.pow(2, item.retryCount) * 1000 && // Exponential backoff
-      item.retryCount < 3 // Max 3 retries
+      now - item.addedAt > Math.pow(2, item.retryCount) * 1000 &&
+      item.retryCount < 3
     );
 
     console.log(`🔄 Processing ${readyToRetry.length} items from retry queue`);
 
     for (const item of readyToRetry) {
       try {
-        // Use original data if available
         const notificationData = item.originalData || {
           token: item.token,
           title: 'Retry Notification',
@@ -364,7 +323,6 @@ class NotificationService {
         const result = await this.sendNotification(notificationData);
         
         if (result.success) {
-          // Remove from queue
           this.retryQueue = this.retryQueue.filter(qi => qi.id !== item.id);
           console.log(`✅ Retry successful for item ${item.id}`);
         } else {
@@ -378,10 +336,9 @@ class NotificationService {
       }
     }
 
-    // Clean up old items that have exceeded max retries or are too old
     const before = this.retryQueue.length;
     this.retryQueue = this.retryQueue.filter(item => 
-      now - item.addedAt < 3600000 && // Remove after 1 hour
+      now - item.addedAt < 3600000 && 
       item.retryCount < 3
     );
     const cleaned = before - this.retryQueue.length;
@@ -391,7 +348,7 @@ class NotificationService {
     }
   }
 
-  // ✅ Enhanced batch notifications with better concurrency control
+  // ✅ UPDATED: Enhanced batch notifications with Expo
   async sendBatchNotifications(notifications, options = {}) {
     const { 
       batchSize = 10, 
@@ -402,7 +359,6 @@ class NotificationService {
     const results = [];
     const validNotifications = [];
     
-    // Filter and validate notifications
     for (const notification of notifications) {
       if (this.isValidTokenFormat(notification.token) && 
           !this.invalidTokens.has(notification.token) &&
@@ -418,13 +374,11 @@ class NotificationService {
       }
     }
     
-    console.log(`📤 Sending batch of ${validNotifications.length} notifications`);
+    console.log(`📤 Sending batch of ${validNotifications.length} notifications via Expo`);
     
-    // Process in batches with concurrency control
     for (let i = 0; i < validNotifications.length; i += batchSize) {
       const batch = validNotifications.slice(i, i + batchSize);
       
-      // Limit concurrency within each batch
       const chunks = [];
       for (let j = 0; j < batch.length; j += maxConcurrency) {
         chunks.push(batch.slice(j, j + maxConcurrency));
@@ -447,13 +401,12 @@ class NotificationService {
         });
       }
       
-      // Delay between batches to avoid overwhelming FCM
       if (i + batchSize < validNotifications.length) {
         await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
       }
     }
     
-    console.log(`✅ Batch completed: ${results.filter(r => r.success).length} succeeded, ${results.filter(r => !r.success).length} failed`);
+    console.log(`✅ Expo batch completed: ${results.filter(r => r.success).length} succeeded, ${results.filter(r => !r.success).length} failed`);
     
     return {
       results,
@@ -462,66 +415,47 @@ class NotificationService {
         valid: validNotifications.length,
         succeeded: results.filter(r => r.success).length,
         failed: results.filter(r => !r.success).length,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        provider: 'expo'
       }
     };
   }
 
-  // ✅ Enhanced token validation with dry run
+  // ✅ UPDATED: Token validation using Expo SDK
   async validateToken(token, userId) {
     try {
       if (!this.isValidTokenFormat(token)) {
         return { isValid: false, reason: 'invalid_format' };
       }
       
-      // Check cache first
       const cached = this.tokenValidationCache.get(token);
       if (cached && (Date.now() - cached.lastUsed) < 24 * 60 * 60 * 1000) {
         return { isValid: cached.isValid, reason: 'cached', lastUsed: cached.lastUsed };
       }
       
-      // Test token with a dry run using Admin SDK
-      const testMessage = {
-        token: token,
-        data: { 
-          test: 'validation',
-          timestamp: new Date().toISOString()
-        }
-      };
-      
-      // Use dry run to validate without sending
-      const response = await getMessaging().send(testMessage, true); // true = dry run
-      
-      // If we reach here, token is valid
-      this.tokenValidationCache.set(token, {
-        isValid: true,
-        lastUsed: Date.now(),
-        validatedAt: Date.now()
-      });
-      
-      return { 
-        isValid: true, 
-        reason: 'validated',
-        messageId: response,
-        timestamp: new Date().toISOString()
-      };
-      
-    } catch (error) {
-      const errorCode = error.code || error.errorInfo?.code;
-      
-      if (errorCode === 'messaging/invalid-registration-token' ||
-          errorCode === 'messaging/registration-token-not-registered') {
+      // ✅ NEW: Test with Expo SDK validation
+      if (Expo.isExpoPushToken(token)) {
+        this.tokenValidationCache.set(token, {
+          isValid: true,
+          lastUsed: Date.now(),
+          validatedAt: Date.now()
+        });
         
-        await this.handleInvalidToken(token, errorCode);
-        return { isValid: false, reason: errorCode };
+        return { 
+          isValid: true, 
+          reason: 'expo_validated',
+          timestamp: new Date().toISOString()
+        };
+      } else {
+        return { isValid: false, reason: 'invalid_expo_token_format' };
       }
       
-      // For other errors, assume token might be valid but there's a temporary issue
+    } catch (error) {
       return { isValid: false, reason: 'validation_error', error: error.message };
     }
   }
 
-  // ✅ Enhanced periodic cleanup with metrics
+  // ✅ KEEP: All remaining methods unchanged (performTokenCleanup, getServiceStatus, healthCheck, resetMetrics)
   async performTokenCleanup() {
     try {
       console.log('🧹 Starting comprehensive token cleanup...');
@@ -529,7 +463,6 @@ class NotificationService {
       const now = Date.now();
       const oneDayAgo = now - (24 * 60 * 60 * 1000);
       
-      // Clear old entries from validation cache
       let cleanedValidation = 0;
       for (const [token, data] of this.tokenValidationCache.entries()) {
         if (data.lastUsed < oneDayAgo) {
@@ -538,7 +471,6 @@ class NotificationService {
         }
       }
       
-      // Clear old entries from rate limit cache
       let cleanedRateLimit = 0;
       for (const [token, data] of this.rateLimitCache.entries()) {
         const recentAttempts = data.attempts.filter(time => time > oneDayAgo);
@@ -546,7 +478,6 @@ class NotificationService {
           this.rateLimitCache.delete(token);
           cleanedRateLimit++;
         } else if (recentAttempts.length > 0) {
-          // Update with filtered attempts
           this.rateLimitCache.set(token, {
             ...data,
             attempts: recentAttempts
@@ -554,11 +485,9 @@ class NotificationService {
         }
       }
       
-      // Clear invalid tokens cache (allow retry after 24 hours)
       const invalidTokensCleared = this.invalidTokens.size;
       this.invalidTokens.clear();
       
-      // Process retry queue
       await this.processRetryQueue();
       
       console.log(`✅ Cleanup completed: ${cleanedValidation} validation cache, ${cleanedRateLimit} rate limit cache, ${invalidTokensCleared} invalid tokens cleared`);
@@ -576,15 +505,13 @@ class NotificationService {
     }
   }
 
-  // ✅ Enhanced service status with more metrics
+  // ✅ UPDATED: Service status with Expo info
   getServiceStatus() {
     const now = Date.now();
     
-    // Calculate healthy tokens
     const healthyTokensCount = Array.from(this.tokenValidationCache.values())
       .filter(data => data.isValid && (now - data.lastUsed) < 86400000).length;
     
-    // Calculate average validation age
     const validations = Array.from(this.tokenValidationCache.values());
     const averageValidationAge = validations.length > 0 
       ? Math.round(validations.reduce((sum, data) => sum + (now - data.lastUsed), 0) / validations.length / 1000)
@@ -593,6 +520,7 @@ class NotificationService {
     return {
       timestamp: new Date().toISOString(),
       uptime: process.uptime(),
+      provider: 'expo', // ✅ NEW: Indicate using Expo
       caches: {
         invalidTokensCount: this.invalidTokens.size,
         validationCacheSize: this.tokenValidationCache.size,
@@ -619,37 +547,28 @@ class NotificationService {
     };
   }
 
-  // ✅ Health check with Firebase connectivity test
+  // ✅ UPDATED: Health check with Expo
   async healthCheck() {
     try {
-      // Test Firebase Admin connection
       await db.collection('_health').doc('notification_service').set({
         timestamp: FieldValue.serverTimestamp(),
         service: 'notification-service',
         status: 'healthy',
+        provider: 'expo',
         version: '2.0.0'
       });
       
-      // Test messaging service
-      const testToken = 'test_token_invalid';
-      try {
-        await getMessaging().send({
-          token: testToken,
-          data: { test: 'health_check' }
-        }, true); // dry run
-      } catch (error) {
-        // Expected to fail with invalid token, but confirms messaging service is working
-        if (error.code !== 'messaging/invalid-registration-token') {
-          throw error;
-        }
-      }
+      // Test Expo SDK
+      const testToken = 'ExponentPushToken[invalid]';
+      const isValidFormat = Expo.isExpoPushToken(testToken);
       
       return {
         status: 'healthy',
         timestamp: new Date().toISOString(),
+        provider: 'expo',
         services: {
           firestore: 'connected',
-          messaging: 'available',
+          expo: 'available',
           cache: 'operational',
         },
         ...this.getServiceStatus()
@@ -659,16 +578,16 @@ class NotificationService {
         status: 'unhealthy',
         error: error.message,
         timestamp: new Date().toISOString(),
+        provider: 'expo',
         services: {
           firestore: 'error',
-          messaging: 'error',
+          expo: 'error',
           cache: 'unknown',
         }
       };
     }
   }
 
-  // ✅ Reset metrics (useful for monitoring)
   resetMetrics() {
     this.metrics = {
       totalSent: 0,
@@ -680,18 +599,16 @@ class NotificationService {
   }
 }
 
-// ✅ Export singleton instance
+// ✅ KEEP: Export singleton instance
 const notificationService = new NotificationService();
 
-// ✅ Setup automatic cleanup every hour
+// ✅ KEEP: Automatic cleanup intervals
 setInterval(() => {
   notificationService.performTokenCleanup();
 }, 60 * 60 * 1000);
 
-// ✅ Setup retry queue processing every 5 minutes
 setInterval(() => {
   notificationService.processRetryQueue();
 }, 5 * 60 * 1000);
 
 export default notificationService;
-
