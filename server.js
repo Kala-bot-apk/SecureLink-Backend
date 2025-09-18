@@ -41,7 +41,11 @@ const getExternalUrl = () => {
 };
 
 // ✅ Enhanced Prometheus Metrics Setup
+// ✅ ENHANCED: Safe Prometheus Metrics Setup
 const register = new client.Registry();
+let httpRequestDurationMicroseconds, httpRequestTotal, activeWebSocketConnections;
+let totalMessages, notificationsSent, authenticationAttempts, firebaseOperations;
+let connectionErrors, resourceUsage;
 
 if (ENABLE_METRICS) {
   // Collect default Node.js metrics
@@ -53,55 +57,55 @@ if (ENABLE_METRICS) {
   });
 
   // Custom metrics
-  const httpRequestDurationMicroseconds = new client.Histogram({
+  httpRequestDurationMicroseconds = new client.Histogram({
     name: 'http_request_duration_ms',
     help: 'Duration of HTTP requests in ms',
     labelNames: ['method', 'route', 'status_code', 'user_agent'],
     buckets: [0.1, 5, 15, 50, 100, 200, 300, 400, 500, 1000, 2000, 5000]
   });
 
-  const httpRequestTotal = new client.Counter({
+  httpRequestTotal = new client.Counter({
     name: 'http_requests_total',
     help: 'Total number of HTTP requests',
     labelNames: ['method', 'route', 'status_code', 'user_agent']
   });
 
-  const activeWebSocketConnections = new client.Gauge({
+  activeWebSocketConnections = new client.Gauge({
     name: 'websocket_connections_active',
     help: 'Number of active WebSocket connections'
   });
 
-  const totalMessages = new client.Counter({
+  totalMessages = new client.Counter({
     name: 'chat_messages_total',
     help: 'Total number of chat messages sent',
     labelNames: ['message_type', 'status', 'sender_platform']
   });
 
-  const notificationsSent = new client.Counter({
+  notificationsSent = new client.Counter({
     name: 'notifications_sent_total',
     help: 'Total number of push notifications sent',
     labelNames: ['platform', 'status', 'notification_type']
   });
 
-  const authenticationAttempts = new client.Counter({
+  authenticationAttempts = new client.Counter({
     name: 'authentication_attempts_total',
     help: 'Total number of authentication attempts',
     labelNames: ['method', 'status', 'failure_reason']
   });
 
-  const firebaseOperations = new client.Counter({
+  firebaseOperations = new client.Counter({
     name: 'firebase_operations_total',
     help: 'Total number of Firebase operations',
     labelNames: ['operation_type', 'status', 'collection']
   });
 
-  const connectionErrors = new client.Counter({
+  connectionErrors = new client.Counter({
     name: 'connection_errors_total',
     help: 'Total number of connection errors',
     labelNames: ['error_type', 'source']
   });
 
-  const resourceUsage = new client.Gauge({
+  resourceUsage = new client.Gauge({
     name: 'resource_usage',
     help: 'System resource usage',
     labelNames: ['resource_type']
@@ -111,7 +115,26 @@ if (ENABLE_METRICS) {
   [httpRequestDurationMicroseconds, httpRequestTotal, activeWebSocketConnections, 
    totalMessages, notificationsSent, authenticationAttempts, firebaseOperations, 
    connectionErrors, resourceUsage].forEach(metric => register.registerMetric(metric));
+
+  console.log('✅ Prometheus metrics enabled');
+} else {
+  console.log('⚠️ Prometheus metrics disabled');
 }
+// ✅ Safe metrics helper
+function safeIncrementMetric(metric, labels = []) {
+  if (ENABLE_METRICS && metric && typeof metric.inc === 'function') {
+    try {
+      if (labels.length > 0) {
+        metric.labels(...labels).inc();
+      } else {
+        metric.inc();
+      }
+    } catch (error) {
+      console.warn('⚠️ Metrics error:', error.message);
+    }
+  }
+}
+
 
 // ✅ Enhanced Socket.io Configuration
 const io = new Server(server, {
@@ -173,20 +196,33 @@ app.use(bodyParser.json({
   }
 }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
+// ✅ Add root route handler
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    message: 'SecureLink Server is running',
+    version: '1.0.0',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ✅ Handle HEAD requests for health checks
+app.head('/', (req, res) => {
+  res.status(200).end();
+});
 
 // ✅ Enhanced Request Logging and Metrics
+// ✅ FIXED: Add conditional check for metrics
 app.use((req, res, next) => {
   const start = Date.now();
   const userAgent = req.get('User-Agent') || 'unknown';
-  
-  // Log request
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - ${req.ip} - ${userAgent}`);
   
   res.on('finish', () => {
     const responseTimeInMs = Date.now() - start;
     const route = req.route?.path || req.path;
     
-    if (ENABLE_METRICS) {
+    // ✅ Only use metrics if they're enabled and defined
+    if (ENABLE_METRICS && typeof httpRequestDurationMicroseconds !== 'undefined') {
       httpRequestDurationMicroseconds
         .labels(req.method, route, res.statusCode.toString(), userAgent.split('/')[0])
         .observe(responseTimeInMs);
@@ -205,7 +241,9 @@ app.use((req, res, next) => {
   next();
 });
 
+
 // ✅ Enhanced Rate Limiting with IP whitelist
+// ✅ FIXED: Rate limiting with conditional metrics
 const createRateLimiter = (windowMs, max, message, skipWhitelist = []) => {
   return rateLimit({
     windowMs,
@@ -214,22 +252,29 @@ const createRateLimiter = (windowMs, max, message, skipWhitelist = []) => {
     standardHeaders: true,
     legacyHeaders: false,
     skip: (req) => {
-      // Skip rate limiting for whitelisted IPs
       const clientIp = req.ip || req.connection.remoteAddress;
       return skipWhitelist.some(ip => clientIp.includes(ip));
     },
     handler: (req, res) => {
       console.warn(`⚠️ Rate limit exceeded for IP: ${req.ip}, path: ${req.path}`);
-      if (ENABLE_METRICS) {
+      
+      // ✅ Only increment counter if metrics are enabled and defined
+      if (ENABLE_METRICS && typeof connectionErrors !== 'undefined') {
         connectionErrors.labels('rate_limit', 'http').inc();
       }
-      res.status(429).json({ error: message, code: 'RATE_LIMITED', retryAfter: Math.ceil(windowMs / 1000) });
+      
+      res.status(429).json({ 
+        error: message, 
+        code: 'RATE_LIMITED', 
+        retryAfter: Math.ceil(windowMs / 1000) 
+      });
     },
     keyGenerator: (req) => {
       return req.ip + ':' + req.path;
     }
   });
 };
+
 
 // Apply rate limiting
 const whitelistedIPs = process.env.WHITELISTED_IPS?.split(',') || [];
@@ -1381,25 +1426,34 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
 // Enhanced uncaught exception handling
+// ✅ FIXED: Add conditional check for connectionErrors
 process.on('uncaughtException', (error) => {
   console.error('💥 Uncaught Exception:', error);
-  if (ENABLE_METRICS) {
+  
+  // ✅ Only increment counter if metrics are enabled and defined
+  if (ENABLE_METRICS && typeof connectionErrors !== 'undefined') {
     connectionErrors.labels('uncaught_exception', 'process').inc();
   }
+  
   // Give time to log the error, then exit
   setTimeout(() => process.exit(1), 1000);
 });
 
+// ✅ FIXED: Add conditional check for unhandled rejection
 process.on('unhandledRejection', (reason, promise) => {
   console.error('🚫 Unhandled Rejection at:', promise, 'reason:', reason);
-  if (ENABLE_METRICS) {
+  
+  // ✅ Only increment counter if metrics are enabled and defined
+  if (ENABLE_METRICS && typeof connectionErrors !== 'undefined') {
     connectionErrors.labels('unhandled_rejection', 'process').inc();
   }
+  
   // Don't exit on unhandled rejection in production, just log it
   if (!IS_PRODUCTION) {
     setTimeout(() => process.exit(1), 1000);
   }
 });
+
 
 // ✅ Enhanced Server Startup
 const startServer = async () => {
@@ -1459,3 +1513,4 @@ export {
   register,
   notificationService
 };
+
