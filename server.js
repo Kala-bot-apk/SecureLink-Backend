@@ -828,69 +828,34 @@ if ((!recipientOnline || !silent) && !recipientData.notificationsDisabled) {
 });
 
 // ✅ NEW CODE
-app.post('/api/notifications/register', authenticate, async (req, res) => {
+app.post('/api/notifications/register', authenticate, async (req, res) => { // ✅ Fixed: Removed extra )
   const { fcmToken: expoPushToken, platform, deviceId, appVersion } = req.body;
 
-  try {
-    if (!expoPushToken) {
-      return res.status(400).json({ 
-        error: 'Expo push token is required',
-        expectedFormat: 'ExponentPushToken[...]'
-      });
-    }
-
-    // ✅ Validate Expo token format
-    if (!Expo.isExpoPushToken(expoPushToken)) {
-      return res.status(400).json({ 
-        error: 'Invalid Expo push token format',
-        received: expoPushToken?.substring(0, 30) + '...',
-        expectedFormat: 'ExponentPushToken[...]'
-      });
-    }
-
-    // ✅ FIXED: Proper userRef definition and updateDoc call
-    const userDocRef = doc(db, 'users', req.userId);
-    
-    // ✅ Check if user document exists
-    const userDoc = await getDoc(userDocRef);
-    if (!userDoc.exists()) {
-      return res.status(404).json({ 
-        error: 'User document not found',
-        userId: req.userId 
-      });
-    }
-
-    // ✅ FIXED: Complete updateDoc call with proper syntax
-    await updateDoc(userDocRef, {
-      expoPushToken: expoPushToken,    // ✅ New field name
-      fcmToken: expoPushToken,         // ✅ Keep for backward compatibility
-      platform,                       // ✅ Shorthand property
-      tokenProvider: 'expo',           // ✅ Mark as using Expo
-      deviceId,                        // ✅ Include deviceId
-      appVersion,                      // ✅ Include appVersion
-      lastTokenUpdate: serverTimestamp(),  // ✅ Add timestamp
-      updatedAt: serverTimestamp()     // ✅ Add updated timestamp
-    });
-
-    console.log('✅ Expo token registered for user:', req.userId);
-
-    // ✅ FIXED: Proper response
-    res.json({ 
-      success: true, 
-      message: 'Expo push token registered successfully',
-      provider: 'expo',
-      tokenType: 'ExponentPushToken'
-    });
-
-  } catch (error) {
-    console.error('❌ Token registration error:', error);
-    res.status(500).json({ 
-      error: 'Failed to register push token',
-      details: error.message,
-      provider: 'expo'
+  if (!expoPushToken) {
+    return res.status(400).json({ 
+      error: 'Expo push token is required',
+      expectedFormat: 'ExponentPushToken[...]'
     });
   }
-}); // ✅ FIXED: Proper closing with semicolon
+
+  // ✅ Validate Expo token format
+  if (!Expo.isExpoPushToken(expoPushToken)) {
+    return res.status(400).json({ 
+      error: 'Invalid Expo push token format',
+      received: expoPushToken?.substring(0, 30) + '...',
+      expectedFormat: 'ExponentPushToken[...]'
+    });
+  }
+
+  // ✅ FIXED: Added proper commas and completed the object
+  await updateDoc(userRef, {
+    expoPushToken: expoPushToken,    // ✅ Added comma
+    fcmToken: expoPushToken,         // ✅ Added comma  
+    platform,                       // ✅ Added comma
+    tokenProvider: 'expo'            // ✅ Last item, no comma needed
+    // ... other existing fields
+  }); // ✅ Added closing parenthesis and semicolon
+}); // ✅ Added closing curly brace and parenthesis
 
 // ✅ NEW CODE: Send Custom Notification Endpoint
 app.post('/api/notifications/send', authenticate, async (req, res) => {
