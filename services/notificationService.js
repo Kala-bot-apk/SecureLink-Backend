@@ -1,7 +1,7 @@
 // services/notificationService.js - ENHANCED BACKEND NODE.JS VERSION
 import { getMessaging } from 'firebase-admin/messaging';
 import { FieldValue } from 'firebase-admin/firestore';
-import { db } from './firebaseAdmin.js';
+import { db } from '../firebaseAdmin.js';
 
 class NotificationService {
   constructor() {
@@ -694,3 +694,4 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 export default notificationService;
+
